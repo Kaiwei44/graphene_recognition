@@ -1,0 +1,4 @@
+_BASE_: "./base_config.yaml"
+DATASETS:
+  TRAIN: ("MoSe2_train",)
+  TEST: ("MoSe2_test",)

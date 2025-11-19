@@ -1,0 +1,19 @@
+.controlDiv {
+  display: flex;
+  flex-direction: column;
+  width: 80%;
+}
+
+.outerDiv {
+  display: flex;
+  flex-direction: column;
+
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 2em;
+  margin-top: 2em;
+}
+
+.inputDiv {
+  margin: 0.5em;
+}

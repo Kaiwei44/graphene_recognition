@@ -1,0 +1,9 @@
+{
+  "fit_config": {
+    "C": 1,
+    "penalty": "l2",
+    "solver": "saga",
+    "max_iter": 10000,
+    "class_weight": "balanced"
+  }
+}

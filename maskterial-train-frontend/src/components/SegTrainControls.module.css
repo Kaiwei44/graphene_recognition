@@ -1,0 +1,39 @@
+.controlDiv {
+  display: flex;
+  flex-direction: column;
+  width: 80%;
+}
+
+.outerDiv {
+  display: flex;
+  max-width: 80vw;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 2em;
+  margin-top: 2em;
+}
+
+.inputDiv {
+  margin: 0.5em;
+}
+
+.dangerzone {
+  background-color: rgb(255, 221, 221) !important;
+  border-color: red !important;
+}
+
+.consoleOutput {
+  display: flex;
+  flex-direction: column-reverse;
+  font-family: monospace;
+  color: #ffffff;
+  background: #313131;
+  width: 80%;
+  height: 10em;
+  overflow: scroll;
+  border: 1px solid;
+  border-radius: 5px;
+  padding: 0.5em;
+  margin: 0.5em;
+}

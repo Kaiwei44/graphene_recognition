@@ -1,0 +1,28 @@
+.ModelTable table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.ModelTable th,
+.ModelTable td {
+  padding: 8px;
+  text-align: left; /* Default for most columns */
+  border-bottom: 1px solid #ddd;
+}
+
+.ModelTable th:nth-child(1), /* Model Type */
+.ModelTable td:nth-child(1) {
+  width: 30%;
+  text-align: left;
+}
+
+.ModelTable th:nth-child(3), /* Actions */
+.ModelTable td:nth-child(3) {
+  width: 30%;
+  text-align: center;
+}
+
+.ModelTable th:nth-child(2), /* Model Name */
+.ModelTable td:nth-child(2) {
+  width: 40%; /* Remaining width */
+}

@@ -1,0 +1,66 @@
+# Keep all .gitkeep files everywhere
+!**/.gitkeep
+
+output
+experiments
+logs
+data/models/classification_models/AMM/*
+!data/models/classification_models/AMM/.gitkeep
+
+data/models/classification_models/GMM/*
+!data/models/classification_models/GMM/.gitkeep
+
+data/models/postprocessing_models/L2/*
+!data/models/postprocessing_models/L2/.gitkeep
+
+
+data/models/segmentation_models/M2F/*
+!data/models/segmentation_models/M2F/.gitkeep
+
+data/models/*
+data/datasets/*
+data/*
+
+out
+metrics/
+slurm/
+ARCHIVE/
+
+*.diff
+
+# compilation and distribution
+__pycache__
+_ext
+*.pyc
+*.pyd
+*.so
+*.dll
+*.egg-info/
+build/
+dist/
+wheels/
+.ruff_cache/
+
+# pytorch/python/numpy formats
+*.pth
+*.pkl
+*.npy
+*.ts
+model_ts*.txt
+
+# ipython/jupyter notebooks
+**/.ipynb_checkpoints/
+
+# Editor temporaries
+*.swn
+*.swo
+*.swp
+*~
+
+# editor settings
+.idea
+.vscode
+_darcs
+
+
+wandb

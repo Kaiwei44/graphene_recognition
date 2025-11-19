@@ -1,0 +1,4 @@
+_BASE_: "./base_config.yaml"
+DATASETS:
+  TRAIN: ("GrapheneL_train",)
+  TEST: ("GrapheneL_test",)

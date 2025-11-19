@@ -1,0 +1,4 @@
+_BASE_: "./base_config.yaml"
+DATASETS:
+  TRAIN: ("WS2_train",)
+  TEST: ("WS2_test",)

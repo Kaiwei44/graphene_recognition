@@ -1,0 +1,54 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - data_mount:/maskterial/data
+    command: bash -c "python -m uvicorn server:app --host 0.0.0.0 --port 8000"
+
+  nginx:
+    image: nginx:1.27.2-alpine
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    volumes:
+      - build_mount:/usr/share/nginx/html
+      - ./etc/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      frontend_builder:
+        condition: service_completed_successfully
+      backend:
+        condition: service_started
+
+  frontend_builder:
+    environment:
+      - VITE_AVAILABLE_MODELS_URL=http://127.0.0.1:8000/api/available_models
+      - VITE_INFERENCE_URL=http://127.0.0.1:8000/api/predict
+      - VITE_DOWNLOAD_MODEL_URL=http://127.0.0.1:8000/api/download_model
+      - VITE_GMM_UPLOAD_URL=http://127.0.0.1:8000/api/upload/gmm
+      - VITE_AMM_UPLOAD_URL=http://127.0.0.1:8000/api/upload/amm
+      - VITE_M2F_UPLOAD_URL=http://127.0.0.1:8000/api/upload/m2f
+      - VITE_DELETE_MODEL_URL=http://127.0.0.1:8000/api/delete_model
+      - VITE_M2F_TRAIN_URL=http://127.0.0.1:8000/api/train/m2f
+    build:
+      context: ./maskterial-train-frontend
+      dockerfile: Dockerfile
+    restart: "no"
+    volumes:
+      - build_mount:/app/dist
+    command: "npm run build"
+
+volumes:
+  data_mount:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
+  build_mount:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./maskterial-train-frontend/dist

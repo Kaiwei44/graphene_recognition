@@ -1,0 +1,12 @@
+{
+  "data_params": {
+    "max_samples_per_class": 30000,
+    "loaded_test_samples": 50000,
+    "uniform_class_sampling": true,
+    "use_normalization": false,
+    "use_DBSCAN": true,
+    "DBSCAN_eps": 0.1,
+    "use_Nearest_Neighbors": true,
+    "neighbors": 25
+  }
+}

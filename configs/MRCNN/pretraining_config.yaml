@@ -1,0 +1,95 @@
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl" # ImageNet pre-trained weights
+  MASK_ON: True
+  # Approximate for the pretraining dataset of simulated Flakes
+  PIXEL_MEAN:
+    - 107.0
+    - 148.0
+    - 85.0
+  PIXEL_STD:
+    - 33.0
+    - 34.0
+    - 40.0
+  META_ARCHITECTURE: "GeneralizedRCNN"
+  BACKBONE:
+    NAME: "build_resnet_fpn_backbone"
+  RESNETS:
+    DEPTH: 50
+    OUT_FEATURES: ["res2", "res3", "res4", "res5"]
+  FPN:
+    IN_FEATURES: ["res2", "res3", "res4", "res5"]
+  ANCHOR_GENERATOR:
+    SIZES: [[32], [64], [128], [256], [512]] # One size for each in feature map
+    ASPECT_RATIOS: [[0.5, 1.0, 2.0]] # Three aspect ratios (same for all in feature maps)
+  RPN:
+    IN_FEATURES: ["p2", "p3", "p4", "p5", "p6"]
+    PRE_NMS_TOPK_TRAIN: 2000 # Per FPN level
+    PRE_NMS_TOPK_TEST: 1000 # Per FPN level
+    # Detectron1 uses 2000 proposals per-batch,
+    # (See "modeling/rpn/rpn_outputs.py" for details of this legacy issue)
+    # which is approximately 1000 proposals per-image since the default batch size for FPN is 2.
+    POST_NMS_TOPK_TRAIN: 1000
+    POST_NMS_TOPK_TEST: 1000
+  ROI_HEADS:
+    NAME: "StandardROIHeads"
+    IN_FEATURES: ["p2", "p3", "p4", "p5"]
+  ROI_BOX_HEAD:
+    NAME: "FastRCNNConvFCHead"
+    NUM_FC: 2
+    POOLER_RESOLUTION: 7
+    CLS_AGNOSTIC_BBOX_REG: True
+  ROI_MASK_HEAD:
+    NAME: "MaskRCNNConvUpsampleHead"
+    NUM_CONV: 4
+    POOLER_RESOLUTION: 14
+    CLS_AGNOSTIC_MASK: True
+SOLVER:
+  IMS_PER_BATCH: 48
+  BASE_LR: 0.001 # always note the BS -> BS = 0.001 * BS / 16
+  BASE_LR_END: 0.00004
+  MAX_ITER: 100000
+  CHECKPOINT_PERIOD: 20000
+  LR_SCHEDULER_NAME: "WarmupMultiStepLR"
+  WARMUP_FACTOR: 0.001
+  WARMUP_ITERS: 1000
+  WARMUP_METHOD: linear
+  STEPS:
+    - 40000
+    - 80000
+  AMP:
+    ENABLED: True
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "value"
+    CLIP_VALUE: 1.0
+TEST:
+  EVAL_PERIOD: 5000
+DATALOADER:
+  FILTER_EMPTY_ANNOTATIONS: False
+  NUM_WORKERS: 64
+VERSION: 2
+INPUT:
+  MASK_FORMAT: "bitmask"
+  MIN_SIZE_TEST: 0 # disable resizing during testing
+  FORMAT: "BGR"
+  CROP:
+    ENABLED: false
+
+DATASETS:
+  TRAIN:
+    - Synthetic_CrI3_train
+    - Synthetic_Graphene_train
+    - Synthetic_MoSe2_train
+    - Synthetic_hBN_train
+    - Synthetic_TaS2_train
+    - Synthetic_WS2_train
+    - Synthetic_WSe2_train
+  TEST:
+    - Synthetic_CrI3_test
+    - Synthetic_Graphene_test
+    - Synthetic_MoSe2_test
+    - Synthetic_hBN_test
+    - Synthetic_TaS2_test
+    - Synthetic_WS2_test
+    - Synthetic_WSe2_test
+SEED: 42
