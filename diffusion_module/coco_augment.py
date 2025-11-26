@@ -49,8 +49,10 @@ def parse_args() -> argparse.Namespace:
 		default="vit_h",
 		choices=["default", "vit_h", "vit_l", "vit_b"],
 	)
-	parser.add_argument("--prompt", default=AugmentationConfig.prompt)
-	parser.add_argument("--negative-prompt", default=None)
+	parser.add_argument("--prompt", action="append", help="Prompt(s) to use. Can be specified multiple times.")
+	parser.add_argument("--prompt-file", type=Path, help="File containing prompts (one per line)")
+	parser.add_argument("--prompt-strategy", default="random", choices=["random", "cycle"])
+	parser.add_argument("--negative-prompt", default=AugmentationConfig.negative_prompt)
 	parser.add_argument("--strength", type=float, default=0.35)
 	parser.add_argument("--guidance-scale", type=float, default=7.5)
 	parser.add_argument("--num-inference-steps", type=int, default=50)
@@ -89,11 +91,22 @@ def main() -> None:
 	else:
 		device = args.device
 
+	prompts = []
+	if args.prompt:
+		prompts.extend(args.prompt)
+	if args.prompt_file:
+		with open(args.prompt_file, "r", encoding="utf-8") as f:
+			prompts.extend([line.strip() for line in f if line.strip()])
+	
+	if not prompts:
+		prompts = list(AugmentationConfig.prompts)
+
 	config = AugmentationConfig(
 		sd_model_id=args.sd_model_id,
 		sam_model_type=args.sam_model_type,
 		sam_checkpoint=args.sam_checkpoint,
-		prompt=args.prompt,
+		prompts=prompts,
+		prompt_strategy=args.prompt_strategy,
 		negative_prompt=args.negative_prompt,
 		strength=args.strength,
 		guidance_scale=args.guidance_scale,
@@ -127,7 +140,8 @@ def main() -> None:
 
 		image = Image.open(sample.image_path).convert("RGB")
 		try:
-			augmented_image, sam_masks = augmentor.generate_with_boxes(image, boxes)
+			prompt = augmentor.get_next_prompt()
+			augmented_image, sam_masks = augmentor.generate_with_boxes(image, boxes, prompt)
 		except Exception as exc:
 			LOGGER.exception("Failed to augment %s: %s", sample.image_path, exc)
 			continue

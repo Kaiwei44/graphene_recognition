@@ -41,12 +41,12 @@ class AugmentationConfig:
 	sd_model_id: str = "runwayml/stable-diffusion-v1-5"
 	sam_model_type: str = "vit_h"
 	sam_checkpoint: Path = Path("sam_vit_h_4b8939.pth")
-	prompt: str = (
-		"A microscope image of 2D material flakes on a substrate, high resolution, "
-		"scientific photography."
+	prompts: List[str] = (
+		"Scientific optical microscopy, atomically thin 2D material flakes on SiO2 substrate, extremely low contrast, faint interference colors, sharp geometric edges, straight cleavage lines, polygonal crystal shapes, hard angular outlines, flat field illumination, in focus.",
 	)
-	negative_prompt: Optional[str] = None
-	strength: float = 0.35
+	prompt_strategy: str = "random"  # "random" or "cycle"
+	negative_prompt: Optional[str] = "High contrast, thick material, opaque, rounded corners, curved edges, amorphous blobs, glue residue, circular shapes, organic forms, liquid droplets, blurry boundaries, soft edges, shadows, 3D depth, vibrant colors, noise, dust."
+	strength: float = 0.1
 	guidance_scale: float = 7.5
 	num_inference_steps: int = 50
 	seed: int = 42
@@ -166,15 +166,29 @@ class DiffusionAugmentor:
 		sam_model.to(device=config.device)
 		self.sam_predictor = SamPredictor(sam_model)
 
+		self._prompt_cycle = self._cycle_prompts()
+
+	def _cycle_prompts(self) -> Iterable[str]:
+		while True:
+			for prompt in self.config.prompts:
+				yield prompt
+
+	def get_next_prompt(self) -> str:
+		if self.config.prompt_strategy == "random":
+			return np.random.choice(self.config.prompts)
+		else:
+			return next(self._prompt_cycle)
+
 	def generate_with_boxes(
 		self,
 		original_image: Image.Image,
 		boxes_xyxy: Sequence[np.ndarray],
+		prompt: str,
 	) -> Tuple[Image.Image, List[np.ndarray]]:
 		if not boxes_xyxy:
 			raise ValueError("At least one box is required for augmentation")
 		augmented = self.pipe(
-			prompt=self.config.prompt,
+			prompt=prompt,
 			negative_prompt=self.config.negative_prompt,
 			image=original_image,
 			strength=self.config.strength,
@@ -228,7 +242,8 @@ class DiffusionAugmentor:
 			LOGGER.warning("Mask %s is empty; skipping", item.mask_path)
 			return None
 
-		augmented, sam_masks = self.generate_with_boxes(original_image, boxes)
+		prompt = self.get_next_prompt()
+		augmented, sam_masks = self.generate_with_boxes(original_image, boxes, prompt)
 		combined_mask = self._merge_masks(sam_masks)
 
 		output_stem = self._next_output_stem(images_dir, item.image_path.stem)
@@ -297,9 +312,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 		help="SAM backbone variant",
 	)
 	parser.add_argument("--sd-model-id", default="runwayml/stable-diffusion-v1-5")
-	parser.add_argument("--prompt", default=AugmentationConfig.prompt)
-	parser.add_argument("--negative-prompt", default=None)
-	parser.add_argument("--strength", type=float, default=0.35)
+	parser.add_argument("--prompt", action="append", help="Prompt(s) to use. Can be specified multiple times.")
+	parser.add_argument("--prompt-strategy", default="random", choices=["random", "cycle"])
+	parser.add_argument("--negative-prompt", default=AugmentationConfig.negative_prompt)
+	parser.add_argument("--strength", type=float, default=0.1)
 	parser.add_argument("--guidance-scale", type=float, default=7.5)
 	parser.add_argument("--num-inference-steps", type=int, default=50)
 	parser.add_argument("--seed", type=int, default=42)
@@ -332,7 +348,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 		sd_model_id=args.sd_model_id,
 		sam_model_type=args.sam_model_type,
 		sam_checkpoint=args.sam_checkpoint,
-		prompt=args.prompt,
+		prompts=args.prompt or list(AugmentationConfig.prompts),
+		prompt_strategy=args.prompt_strategy,
 		negative_prompt=args.negative_prompt,
 		strength=args.strength,
 		guidance_scale=args.guidance_scale,
