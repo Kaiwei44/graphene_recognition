@@ -155,7 +155,11 @@ class DiffusionAugmentor:
 			torch_dtype=dtype,
 		)
 		if config.disable_safety_checker:
-			pipe.safety_checker = lambda images, clip_input: (images, False)
+			# FIX: Set safety_checker to None directly instead of a lambda.
+			# Newer versions of diffusers handle None correctly and this avoids
+			# the "bool object is not iterable" error.
+			pipe.safety_checker = None
+			pipe.requires_safety_checker = False
 		pipe.enable_attention_slicing()
 		# Use CPU offload to reduce GPU memory usage
 		pipe.enable_model_cpu_offload()
