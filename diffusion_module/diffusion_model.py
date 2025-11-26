@@ -175,9 +175,9 @@ class DiffusionAugmentor:
 
 	def get_next_prompt(self) -> str:
 		if self.config.prompt_strategy == "random":
-			return np.random.choice(self.config.prompts)
+			return str(np.random.choice(self.config.prompts))
 		else:
-			return next(self._prompt_cycle)
+			return str(next(self._prompt_cycle))
 
 	def generate_with_boxes(
 		self,
