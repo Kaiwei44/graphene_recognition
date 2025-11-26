@@ -157,7 +157,8 @@ class DiffusionAugmentor:
 		if config.disable_safety_checker:
 			pipe.safety_checker = lambda images, clip_input: (images, False)
 		pipe.enable_attention_slicing()
-		pipe = pipe.to(config.device)
+		# Use CPU offload to reduce GPU memory usage
+		pipe.enable_model_cpu_offload()
 		self.pipe = pipe
 		self.generator = torch.Generator(device=config.device).manual_seed(config.seed)
 
