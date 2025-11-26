@@ -243,15 +243,29 @@ def main() -> None:
 			
 			# Ensure cropped image is exactly 512x512 (pad if necessary for edge cases)
 			if cropped_img.size != (512, 512):
-				# This shouldn't happen with proper clamping, but handle it gracefully
-				LOGGER.warning(
-					"Cropped image for ann %d is %s instead of 512x512; padding/resizing",
-					ann_id, cropped_img.size
+				LOGGER.debug(
+					"Cropped image for ann %d is %dx%d instead of 512x512; applying reflection padding",
+					ann_id, cropped_img.size[0], cropped_img.size[1]
 				)
-				# Create a new 512x512 image and paste the crop
-				padded_img = Image.new("RGB", (512, 512), (0, 0, 0))
-				padded_img.paste(cropped_img, (0, 0))
-				cropped_img = padded_img
+				# Convert PIL to numpy for reflection padding
+				img_array = np.array(cropped_img)
+				curr_h, curr_w = img_array.shape[:2]
+				
+				# Calculate padding needed (only on right and bottom)
+				h_pad = 512 - curr_h
+				w_pad = 512 - curr_w
+				
+				# Apply reflection padding: ((top, bottom), (left, right), (channels))
+				# Critical: (0, h_pad) means "no padding on top, pad on bottom"
+				# This maintains the (0,0) anchor point for coordinate mapping
+				padded_array = np.pad(
+					img_array,
+					pad_width=((0, h_pad), (0, w_pad), (0, 0)),
+					mode='reflect'
+				)
+				
+				# Convert back to PIL
+				cropped_img = Image.fromarray(padded_array)
 			
 			# 2. Coordinate mapping: global bbox -> local bbox on 512x512 patch
 			local_x1 = global_bbox[0] - crop_origin[0]
