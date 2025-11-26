@@ -51,7 +51,9 @@ class CocoDataset:
 		)
 
 	def iter_samples(self, image_root: Path) -> Iterable[CocoSample]:
-		for image_id, image_info in self.images.items():
+		# Use list() to create a snapshot of items to avoid "dictionary changed size during iteration" error
+		# This is necessary because new images are added to self.images during the augmentation loop
+		for image_id, image_info in list(self.images.items()):
 			file_name = image_info["file_name"]
 			image_path = (image_root / file_name).expanduser().resolve()
 			annotations = self.anns_by_image.get(image_id, [])
