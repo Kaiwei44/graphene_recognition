@@ -32,9 +32,14 @@ def parse_args() -> argparse.Namespace:
 		help="Path to write the updated COCO JSON (defaults to <ann> with _aug suffix)",
 	)
 	parser.add_argument(
+		"--output-dir",
+		type=Path,
+		help="Root directory for all outputs (images and annotations). Overrides --output-image-dir and --output-ann.",
+	)
+	parser.add_argument(
 		"--output-image-dir",
 		type=Path,
-		help="Directory for augmented images (defaults to --image-root)",
+		help="Directory for augmented images (defaults to <output-dir> or --image-root)",
 	)
 	parser.add_argument(
 		"--metadata-path",
@@ -73,13 +78,32 @@ def main() -> None:
 	_configure_logging(args.verbose)
 
 	image_root = args.image_root.expanduser().resolve()
-	output_image_dir = (args.output_image_dir or image_root).expanduser().resolve()
-	output_image_dir.mkdir(parents=True, exist_ok=True)
+	
+	if args.output_dir:
+		output_dir = args.output_dir.expanduser().resolve()
+		output_dir.mkdir(parents=True, exist_ok=True)
+		# Default images to output_dir if not specified
+		output_image_dir = (args.output_image_dir or output_dir).expanduser().resolve()
+		
+		# Default annotation to output_dir/filename
+		if args.output_ann:
+			output_ann = args.output_ann.expanduser().resolve()
+		else:
+			# If output_dir is same as input dir, use _aug suffix to avoid overwrite
+			if output_dir == args.ann.parent.expanduser().resolve():
+				output_ann = output_dir / f"{args.ann.stem}_aug.coco.json"
+			else:
+				# If saving to a new directory, keep the original filename (clean copy)
+				output_ann = output_dir / args.ann.name
+	else:
+		# Legacy behavior
+		output_image_dir = (args.output_image_dir or image_root).expanduser().resolve()
+		output_ann = args.output_ann
+		if output_ann is None:
+			output_ann = args.ann.with_name(f"{args.ann.stem}_aug.coco.json")
+		output_ann = output_ann.expanduser().resolve()
 
-	output_ann = args.output_ann
-	if output_ann is None:
-		output_ann = args.ann.with_name(f"{args.ann.stem}_aug.coco.json")
-	output_ann = output_ann.expanduser().resolve()
+	output_image_dir.mkdir(parents=True, exist_ok=True)
 
 	metadata_path = args.metadata_path
 	if metadata_path is None:

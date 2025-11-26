@@ -336,6 +336,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 	args = parse_args(argv)
 	_configure_logging(args.verbose)
 
+	# Helpful hint for COCO users
+	if any(arg in sys.argv for arg in ["--ann", "--coco", "--coco-json"]):
+		LOGGER.warning(
+			"It looks like you are trying to use COCO annotations. "
+			"Please use 'python -m diffusion_module.coco_augment' instead, "
+			"which supports COCO natively."
+		)
+
 	if args.image_dir and not args.mask_dir:
 		raise ValueError("--mask-dir is required when using --image-dir mode")
 
