@@ -306,6 +306,7 @@ def main() -> None:
 				LOGGER.warning("SAM returned no masks for ann %d; skipping", ann_id)
 				continue
 			
+			# 6. Prepare and validate mask
 			sam_mask = sam_masks[0]
 			mask_binary = (sam_mask > 0).astype(np.uint8)
 			
@@ -313,7 +314,21 @@ def main() -> None:
 				LOGGER.warning("SAM predicted empty mask for ann %d; skipping", ann_id)
 				continue
 			
-			# 6. Save the cropped augmented patch
+			# Verify mask shape matches expected 512x512
+			if mask_binary.shape != (512, 512):
+				LOGGER.error(
+					"Mask shape mismatch for ann %d: expected (512, 512), got %s",
+					ann_id, mask_binary.shape
+				)
+				continue
+			
+			# Log mask statistics for verification
+			LOGGER.debug(
+				"Mask for ann %d: shape=%s, nonzero_pixels=%d, dtype=%s",
+				ann_id, mask_binary.shape, np.sum(mask_binary), mask_binary.dtype
+			)
+			
+			# 7. Save the cropped augmented patch
 			# Generate unique filename
 			import random
 			import string
@@ -323,14 +338,26 @@ def main() -> None:
 			output_path = output_image_dir / output_filename
 			
 			augmented_image.save(output_path)
+			LOGGER.debug("Saved augmented patch to: %s", output_path)
 			
-			# 7. Register new COCO entries
-			# Determine the file_name for COCO JSON (relative to image_root if possible)
-			file_name = output_filename
+			# 8. Register new COCO entries
+			# Determine the file_name for COCO JSON
+			# Strategy: Try to make it relative to image_root if possible,
+			# otherwise use absolute path for clarity
 			try:
+				# Try to compute relative path from image_root
 				file_name = output_path.relative_to(image_root).as_posix()
+				LOGGER.debug("Using relative path for COCO: %s", file_name)
 			except ValueError:
-				pass
+				# output_image_dir is not under image_root
+				# Use absolute path to avoid confusion
+				file_name = str(output_path)
+				LOGGER.warning(
+					"Output directory (%s) is not under image_root (%s). "
+					"Using absolute path in COCO JSON: %s. "
+					"You may need to update the COCO JSON or image_root when training.",
+					output_image_dir, image_root, file_name
+				)
 			
 			# Add image entry with hard-coded 512x512 dimensions
 			new_image_id = coco_ds.add_image(
@@ -340,8 +367,14 @@ def main() -> None:
 			)
 			
 			# Add annotation with SAM-generated mask
-			# bbox will be recomputed from mask inside add_annotation
-			coco_ds.add_annotation(new_image_id, category_id, mask_binary)
+			# bbox and area will be recomputed from mask inside add_annotation
+			new_ann_id = coco_ds.add_annotation(new_image_id, category_id, mask_binary)
+			
+			# Verify the annotation was added correctly
+			LOGGER.debug(
+				"Added annotation %d for image %d (file: %s, category: %d)",
+				new_ann_id, new_image_id, file_name, category_id
+			)
 			
 			patches_generated += 1
 			LOGGER.debug("Generated patch %d from ann %d (image %s)", patches_generated, ann_id, sample.image_path.name)
@@ -365,6 +398,30 @@ def main() -> None:
 	with open(metadata_path, "w", encoding="utf-8") as handle:
 		json.dump(metadata_entries, handle, indent=2)
 	LOGGER.info("Wrote metadata to %s", metadata_path)
+	
+	# Provide guidance on using the generated dataset
+	LOGGER.info("=" * 60)
+	LOGGER.info("DATASET GENERATION COMPLETE")
+	LOGGER.info("=" * 60)
+	LOGGER.info("Generated %d augmented patches from %d source images", patches_generated, processed)
+	LOGGER.info("Output images: %s", output_image_dir)
+	LOGGER.info("Output COCO JSON: %s", output_ann)
+	
+	# Check if output_image_dir is under image_root
+	try:
+		output_image_dir.relative_to(image_root)
+		LOGGER.info("✓ Output images are under image_root, ready for training")
+		LOGGER.info("  Use this command for training:")
+		LOGGER.info("    --image-root %s", image_root)
+		LOGGER.info("    --ann %s", output_ann)
+	except ValueError:
+		LOGGER.warning("⚠ Output images are NOT under image_root!")
+		LOGGER.warning("  Option 1: Use output_image_dir as the new image_root:")
+		LOGGER.warning("    --image-root %s", output_image_dir)
+		LOGGER.warning("    --ann %s", output_ann)
+		LOGGER.warning("  Option 2: Move/copy images to be under image_root:")
+		LOGGER.warning("    cp -r %s/* %s/", output_image_dir, image_root)
+	LOGGER.info("=" * 60)
 
 
 def _boxes_from_annotations(sample: CocoSample, padding: int) -> Tuple[List[np.ndarray], List[int]]:
