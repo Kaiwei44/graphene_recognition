@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
+import string
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
@@ -68,6 +70,104 @@ def get_centered_crop(
 	return cropped_image, crop_origin
 
 
+def find_visible_annotations(
+	crop_rect: Tuple[int, int, int, int],
+	annotations: List[dict],
+) -> List[dict]:
+	"""Find all annotations that intersect with the crop region.
+	
+	Args:
+		crop_rect: Crop bounding box as [x1, y1, x2, y2]
+		annotations: List of COCO annotation dicts with 'bbox' field [x, y, w, h]
+	
+	Returns:
+		List of annotations that have any overlap with crop_rect
+	"""
+	crop_x1, crop_y1, crop_x2, crop_y2 = crop_rect
+	visible_anns = []
+	
+	for ann in annotations:
+		bbox = ann["bbox"]  # [x, y, w, h]
+		ann_x1 = bbox[0]
+		ann_y1 = bbox[1]
+		ann_x2 = bbox[0] + bbox[2]
+		ann_y2 = bbox[1] + bbox[3]
+		
+		# Check for intersection
+		# Two rectangles intersect if they overlap in both X and Y axes
+		x_overlap = max(0, min(crop_x2, ann_x2) - max(crop_x1, ann_x1))
+		y_overlap = max(0, min(crop_y2, ann_y2) - max(crop_y1, ann_y1))
+		
+		intersection_area = x_overlap * y_overlap
+		
+		if intersection_area > 0:
+			visible_anns.append(ann)
+	
+	return visible_anns
+
+
+def map_annotations_to_crop(
+	visible_annotations: List[dict],
+	crop_origin: Tuple[int, int],
+	crop_size: int = 512,
+	min_box_size: int = 5,
+) -> Tuple[List[np.ndarray], List[int], List[int]]:
+	"""Map global annotations to local crop coordinates.
+	
+	Args:
+		visible_annotations: List of annotation dicts with 'bbox' and 'category_id' fields
+		crop_origin: (x1, y1) of crop window in original image
+		crop_size: Size of the crop (default: 512)
+		min_box_size: Minimum width/height after clamping (prevents SAM errors)
+	
+	Returns:
+		Tuple of (boxes_xyxy, category_ids, annotation_ids):
+			- boxes_xyxy: List of np.array([x1, y1, x2, y2]) in local coordinates
+			- category_ids: List of category IDs
+			- annotation_ids: List of original annotation IDs
+	"""
+	boxes = []
+	category_ids = []
+	annotation_ids = []
+	
+	crop_x1, crop_y1 = crop_origin
+	
+	for ann in visible_annotations:
+		global_bbox = ann["bbox"]  # [x, y, w, h]
+		
+		# Map to local coordinates
+		local_x1 = global_bbox[0] - crop_x1
+		local_y1 = global_bbox[1] - crop_y1
+		local_x2 = local_x1 + global_bbox[2]
+		local_y2 = local_y1 + global_bbox[3]
+		
+		# Clamp to [0, crop_size]
+		local_x1 = max(0.0, min(float(crop_size), local_x1))
+		local_y1 = max(0.0, min(float(crop_size), local_y1))
+		local_x2 = max(0.0, min(float(crop_size), local_x2))
+		local_y2 = max(0.0, min(float(crop_size), local_y2))
+		
+		# Validity check: skip if box is too small after clamping
+		width = local_x2 - local_x1
+		height = local_y2 - local_y1
+		
+		if width < min_box_size or height < min_box_size:
+			LOGGER.debug(
+				"Skipping ann %d: box size %.1f×%.1f is too small (< %dpx)",
+				ann["id"], width, height, min_box_size
+			)
+			continue
+		
+		# Create box in xyxy format
+		box = np.array([local_x1, local_y1, local_x2, local_y2], dtype=np.float32)
+		boxes.append(box)
+		category_ids.append(int(ann["category_id"]))
+		annotation_ids.append(ann["id"])
+	
+	return boxes, category_ids, annotation_ids
+
+
+
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Augment COCO datasets via Stable Diffusion + SAM")
@@ -110,6 +210,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--num-inference-steps", type=int, default=50)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--bbox-padding", type=int, default=8, help="Pixels to expand annotation bboxes")
+	parser.add_argument("--batch-size", type=int, default=4, help="Batch size for parallel GPU processing (default: 4)")
 	parser.add_argument("--max-samples", type=int)
 	parser.add_argument("--output-suffix", default="_aug")
 	parser.add_argument("--image-ext", default=".png")
@@ -118,6 +219,156 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--skip-existing", action="store_true")
 	parser.add_argument("--verbose", action="store_true")
 	return parser.parse_args()
+
+
+def process_batch(
+	batch_buffer: List[dict],
+	augmentor: DiffusionAugmentor,
+	coco_ds: CocoDataset,
+	output_image_dir: Path,
+	image_root: Path,
+	config: AugmentationConfig,
+) -> Tuple[int, List[dict]]:
+	"""Process a batch of cropped images in parallel using batch GPU processing.
+	
+	Args:
+		batch_buffer: List of dicts with 'image', 'boxes', 'category_ids', 'prompt', etc.
+		augmentor: DiffusionAugmentor instance
+		coco_ds: CocoDataset instance
+		output_image_dir: Output directory for images
+		image_root: Root directory for images
+		config: AugmentationConfig
+	
+	Returns:
+		Tuple of (num_successful_patches, metadata_entries)
+	"""
+	if not batch_buffer:
+		return 0, []
+	
+	# 1. Unpack batch buffer
+	images_batch = [item['image'] for item in batch_buffer]
+	prompts_batch = [item['prompt'] for item in batch_buffer]
+	
+	LOGGER.info("Processing batch of %d images", len(batch_buffer))
+	
+	# 2. Batch generation (parallel processing on GPU)
+	try:
+		augmented_images = augmentor.generate_batch(images_batch, prompts_batch)
+	except Exception as exc:
+		LOGGER.error("Batch generation failed: %s", exc)
+		return 0, []
+	
+	# 3. SAM post-processing and registration (serial, but uses batch SAM)
+	num_successful_patches = 0
+	num_successful_annotations = 0
+	metadata_entries = []
+	
+	for i, (aug_img, item) in enumerate(zip(augmented_images, batch_buffer)):
+		try:
+			# Run batch SAM on the augmented image with all boxes
+			boxes = item['boxes']
+			category_ids = item['category_ids']
+			
+			if not boxes:
+				LOGGER.warning("No valid boxes for patch %d; skipping", i)
+				continue
+			
+			LOGGER.debug(
+				"Running batch SAM with %d boxes for patch from ann %s",
+				len(boxes), item.get('source_ann_ids', 'unknown')
+			)
+			
+			# Batch SAM prediction
+			masks = augmentor.run_sam_batch(aug_img, boxes)
+			
+			if len(masks) != len(category_ids):
+				LOGGER.error(
+					"Mask count mismatch: got %d masks for %d boxes; skipping patch",
+					len(masks), len(boxes)
+				)
+				continue
+			
+			# Save the augmented patch once
+			random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+			output_filename = f"{item['source_filename']}_crop_{item['crop_id']}_{random_suffix}{config.image_ext}"
+			output_path = output_image_dir / output_filename
+			
+			aug_img.save(output_path)
+			LOGGER.debug("Saved augmented patch to: %s", output_path)
+			
+			# Register in COCO (one image, multiple annotations)
+			try:
+				file_name = output_path.relative_to(image_root).as_posix()
+				LOGGER.debug("Using relative path for COCO: %s", file_name)
+			except ValueError:
+				file_name = str(output_path)
+				LOGGER.warning(
+					"Output directory (%s) is not under image_root (%s). "
+					"Using absolute path in COCO JSON: %s. "
+					"You may need to update the COCO JSON or image_root when training.",
+					output_image_dir, image_root, file_name
+				)
+			
+			# Register the image once
+			new_image_id = coco_ds.add_image(file_name=file_name, width=512, height=512)
+			
+			# Register all annotations for this image
+			valid_mask_count = 0
+			for mask, cat_id in zip(masks, category_ids):
+				# Validate mask
+				if np.sum(mask) == 0:
+					LOGGER.debug("Skipping empty mask for category %d in image %d", cat_id, new_image_id)
+					continue
+				
+				# Verify mask shape
+				if mask.shape != (512, 512):
+					LOGGER.error(
+						"Mask shape mismatch for category %d: expected (512, 512), got %s",
+						cat_id, mask.shape
+					)
+					continue
+				
+				# Add annotation to COCO
+				new_ann_id = coco_ds.add_annotation(new_image_id, cat_id, mask)
+				valid_mask_count += 1
+				
+				LOGGER.debug(
+					"Added annotation %d for image %d (category: %d)",
+					new_ann_id, new_image_id, cat_id
+				)
+			
+			if valid_mask_count == 0:
+				LOGGER.warning("No valid masks for patch %d; image saved but no annotations", i)
+			else:
+				num_successful_patches += 1
+				num_successful_annotations += valid_mask_count
+				
+				LOGGER.info(
+					"Successfully processed patch %d: %d/%d annotations valid",
+					i, valid_mask_count, len(masks)
+				)
+			
+			metadata_entries.append({
+				"source_image_id": item.get('source_image_id'),
+				"source_annotation_ids": item.get('source_ann_ids', []),
+				"source_file": item.get('source_file'),
+				"crop_origin": item.get('crop_origin'),
+				"augmented_file": str(output_path),
+				"new_image_id": new_image_id,
+				"category_ids": category_ids,
+				"num_valid_annotations": valid_mask_count,
+			})
+			
+		except Exception as exc:
+			LOGGER.exception("Failed to process batch item %d: %s", i, exc)
+			continue
+	
+	LOGGER.info(
+		"Batch complete: %d patches generated, %d total annotations",
+		num_successful_patches, num_successful_annotations
+	)
+	
+	return num_successful_patches, metadata_entries
 
 
 def main() -> None:
@@ -199,6 +450,7 @@ def main() -> None:
 	metadata_entries = []
 	processed = 0
 	patches_generated = 0
+	batch_buffer = []  # Initialize batch buffer
 	
 	for sample in coco_ds.iter_samples(image_root):
 		if config.max_samples is not None and processed >= config.max_samples:
@@ -229,12 +481,14 @@ def main() -> None:
 		
 		processed += 1
 		
-		for ann in target_anns:
-			ann_id = ann["id"]
-			category_id = int(ann["category_id"])
-			global_bbox = ann["bbox"]  # [x, y, w, h]
+		# Generate crop ID counter for this image
+		crop_id_counter = 0
+		
+		for center_ann in target_anns:
+			ann_id = center_ann["id"]
+			global_bbox = center_ann["bbox"]  # [x, y, w, h]
 			
-			# 1. Perform centered cropping
+			# 1. Perform centered cropping based on the center annotation
 			try:
 				cropped_img, crop_origin = get_centered_crop(original_image, global_bbox, crop_size=512)
 			except Exception as exc:
@@ -267,129 +521,71 @@ def main() -> None:
 				# Convert back to PIL
 				cropped_img = Image.fromarray(padded_array)
 			
-			# 2. Coordinate mapping: global bbox -> local bbox on 512x512 patch
-			local_x1 = global_bbox[0] - crop_origin[0]
-			local_y1 = global_bbox[1] - crop_origin[1]
-			local_x2 = local_x1 + global_bbox[2]
-			local_y2 = local_y1 + global_bbox[3]
+			# 2. Find ALL annotations visible in this crop (not just the center one)
+			crop_x1, crop_y1 = crop_origin
+			crop_rect = (crop_x1, crop_y1, crop_x1 + 512, crop_y1 + 512)
 			
-			# Clamp to [0, 512]
-			local_x1 = max(0.0, min(512.0, local_x1))
-			local_y1 = max(0.0, min(512.0, local_y1))
-			local_x2 = max(0.0, min(512.0, local_x2))
-			local_y2 = max(0.0, min(512.0, local_y2))
+			visible_annotations = find_visible_annotations(crop_rect, annotations)
 			
-			# Construct SAM prompt box
-			input_box = np.array([local_x1, local_y1, local_x2, local_y2], dtype=np.float32)
+			LOGGER.debug(
+				"Crop centered on ann %d has %d visible annotations (of %d total in image)",
+				ann_id, len(visible_annotations), len(annotations)
+			)
 			
-			# 3. Validity assertion: skip if box area is too small
-			box_area = (local_x2 - local_x1) * (local_y2 - local_y1)
-			if box_area < 50:
+			# 3. Map all visible annotations to local coordinates
+			boxes, category_ids, ann_ids = map_annotations_to_crop(
+				visible_annotations,
+				crop_origin,
+				crop_size=512,
+				min_box_size=5
+			)
+			
+			if not boxes:
 				LOGGER.debug(
-					"Skipping ann %d: box area %.1f px² is too small (< 50 px²)",
-					ann_id, box_area
+					"No valid boxes after coordinate mapping for crop centered on ann %d; skipping",
+					ann_id
 				)
 				continue
 			
-			# 4. Call generation pipeline
-			try:
-				prompt = augmentor.get_next_prompt()
-				augmented_image, sam_masks = augmentor.generate_with_boxes(
-					cropped_img, [input_box], prompt
-				)
-			except Exception as exc:
-				LOGGER.exception("Failed to augment ann %d from %s: %s", ann_id, sample.image_path, exc)
-				continue
-			
-			# 5. Validate SAM results
-			if not sam_masks or len(sam_masks) == 0:
-				LOGGER.warning("SAM returned no masks for ann %d; skipping", ann_id)
-				continue
-			
-			# 6. Prepare and validate mask
-			sam_mask = sam_masks[0]
-			mask_binary = (sam_mask > 0).astype(np.uint8)
-			
-			if np.sum(mask_binary) == 0:
-				LOGGER.warning("SAM predicted empty mask for ann %d; skipping", ann_id)
-				continue
-			
-			# Verify mask shape matches expected 512x512
-			if mask_binary.shape != (512, 512):
-				LOGGER.error(
-					"Mask shape mismatch for ann %d: expected (512, 512), got %s",
-					ann_id, mask_binary.shape
-				)
-				continue
-			
-			# Log mask statistics for verification
 			LOGGER.debug(
-				"Mask for ann %d: shape=%s, nonzero_pixels=%d, dtype=%s",
-				ann_id, mask_binary.shape, np.sum(mask_binary), mask_binary.dtype
+				"Crop centered on ann %d: %d/%d visible annotations passed validation",
+				ann_id, len(boxes), len(visible_annotations)
 			)
 			
-			# 7. Save the cropped augmented patch
-			# Generate unique filename
-			import random
-			import string
-			random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-			orig_file_name = Path(sample.image_info["file_name"]).stem
-			output_filename = f"{orig_file_name}_crop_{ann_id}_{random_suffix}{config.image_ext}"
-			output_path = output_image_dir / output_filename
+			# 4. Add to batch buffer with ALL visible objects
+			prompt = augmentor.get_next_prompt()
+			batch_buffer.append({
+				'image': cropped_img,
+				'boxes': boxes,  # List of boxes (multi-object)
+				'category_ids': category_ids,  # List of category IDs
+				'prompt': prompt,
+				'crop_id': crop_id_counter,
+				'source_ann_ids': ann_ids,  # List of source annotation IDs
+				'source_filename': Path(sample.image_info["file_name"]).stem,
+				'source_image_id': sample.image_info["id"],
+				'source_file': str(sample.image_path),
+				'crop_origin': crop_origin,
+			})
 			
-			augmented_image.save(output_path)
-			LOGGER.debug("Saved augmented patch to: %s", output_path)
+			crop_id_counter += 1
 			
-			# 8. Register new COCO entries
-			# Determine the file_name for COCO JSON
-			# Strategy: Try to make it relative to image_root if possible,
-			# otherwise use absolute path for clarity
-			try:
-				# Try to compute relative path from image_root
-				file_name = output_path.relative_to(image_root).as_posix()
-				LOGGER.debug("Using relative path for COCO: %s", file_name)
-			except ValueError:
-				# output_image_dir is not under image_root
-				# Use absolute path to avoid confusion
-				file_name = str(output_path)
-				LOGGER.warning(
-					"Output directory (%s) is not under image_root (%s). "
-					"Using absolute path in COCO JSON: %s. "
-					"You may need to update the COCO JSON or image_root when training.",
-					output_image_dir, image_root, file_name
+			# 5. When buffer is full, process batch
+			if len(batch_buffer) >= args.batch_size:
+				num_successful, batch_metadata = process_batch(
+					batch_buffer, augmentor, coco_ds, output_image_dir, image_root, config
 				)
-			
-			# Add image entry with hard-coded 512x512 dimensions
-			new_image_id = coco_ds.add_image(
-				file_name=file_name,
-				width=512,
-				height=512,
-			)
-			
-			# Add annotation with SAM-generated mask
-			# bbox and area will be recomputed from mask inside add_annotation
-			new_ann_id = coco_ds.add_annotation(new_image_id, category_id, mask_binary)
-			
-			# Verify the annotation was added correctly
-			LOGGER.debug(
-				"Added annotation %d for image %d (file: %s, category: %d)",
-				new_ann_id, new_image_id, file_name, category_id
-			)
-			
-			patches_generated += 1
-			LOGGER.debug("Generated patch %d from ann %d (image %s)", patches_generated, ann_id, sample.image_path.name)
-			
-			metadata_entries.append(
-				{
-					"source_image_id": sample.image_info["id"],
-					"source_annotation_id": ann_id,
-					"source_file": str(sample.image_path),
-					"crop_origin": crop_origin,
-					"augmented_file": str(output_path),
-					"new_image_id": new_image_id,
-					"category_id": category_id,
-				}
-			)
+				patches_generated += num_successful
+				metadata_entries.extend(batch_metadata)
+				batch_buffer = []  # Reset buffer
+	
+	# 6. Process remaining items in buffer
+	if batch_buffer:
+		LOGGER.info("Processing remaining %d items in batch buffer", len(batch_buffer))
+		num_successful, batch_metadata = process_batch(
+			batch_buffer, augmentor, coco_ds, output_image_dir, image_root, config
+		)
+		patches_generated += num_successful
+		metadata_entries.extend(batch_metadata)
 	
 	LOGGER.info("Processed %d images, generated %d augmented patches", processed, patches_generated)
 	coco_ds.save(output_ann)

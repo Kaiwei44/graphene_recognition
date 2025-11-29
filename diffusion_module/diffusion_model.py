@@ -210,6 +210,112 @@ class DiffusionAugmentor:
 			masks.append(masks_pred[0].astype(np.uint8))
 		return augmented, masks
 
+	def generate_batch(
+		self,
+		images: List[Image.Image],
+		prompts: List[str],
+	) -> List[Image.Image]:
+		"""Generate augmented images for a batch of inputs.
+		
+		Args:
+			images: List of PIL Images (all should be same size, typically 512x512)
+			prompts: List of prompts (one per image)
+		
+		Returns:
+			List of augmented PIL Images
+		"""
+		if not images:
+			raise ValueError("At least one image is required")
+		if len(images) != len(prompts):
+			raise ValueError(f"Number of images ({len(images)}) must match number of prompts ({len(prompts)})")
+		
+		# Stable Diffusion pipelines support batch processing natively
+		# Just pass lists instead of single values
+		augmented_images = self.pipe(
+			prompt=prompts,
+			negative_prompt=[self.config.negative_prompt] * len(prompts),
+			image=images,
+			strength=self.config.strength,
+			guidance_scale=self.config.guidance_scale,
+			num_inference_steps=self.config.num_inference_steps,
+			generator=self.generator,
+		).images
+		
+		return augmented_images
+	
+	def run_sam_single(
+		self,
+		image: Image.Image,
+		box_xyxy: np.ndarray,
+	) -> np.ndarray:
+		"""Run SAM on a single image with a single box prompt.
+		
+		Args:
+			image: PIL Image
+			box_xyxy: numpy array [x1, y1, x2, y2]
+		
+		Returns:
+			Binary mask as uint8 numpy array
+		"""
+		image_np = np.array(image)
+		self.sam_predictor.set_image(image_np)
+		masks_pred, _, _ = self.sam_predictor.predict(box=box_xyxy, multimask_output=False)
+		return masks_pred[0].astype(np.uint8)
+
+	def run_sam_batch(
+		self,
+		image: Image.Image,
+		boxes_xyxy: List[np.ndarray],
+	) -> List[np.ndarray]:
+		"""Run SAM on a single image with multiple box prompts in batch mode.
+		
+		This is more efficient than calling run_sam_single in a loop, as it
+		leverages SAM's batch prediction API.
+		
+		Args:
+			image: PIL Image
+			boxes_xyxy: List of numpy arrays [x1, y1, x2, y2]
+		
+		Returns:
+			List of binary masks as uint8 numpy arrays (one per box)
+		"""
+		if not boxes_xyxy:
+			return []
+		
+		# Convert list of boxes to tensor
+		input_boxes = torch.tensor(
+			np.array(boxes_xyxy), 
+			device=self.config.device
+		)
+		
+		# Apply SAM's coordinate transformation
+		# Note: SAM expects (height, width) format
+		image_np = np.array(image)
+		input_boxes = self.sam_predictor.transform.apply_boxes_torch(
+			input_boxes, 
+			original_size=image_np.shape[:2]  # (height, width)
+		)
+		
+		# Set image once for all predictions
+		self.sam_predictor.set_image(image_np)
+		
+		# Batch prediction
+		masks, scores, logits = self.sam_predictor.predict_torch(
+			point_coords=None,
+			point_labels=None,
+			boxes=input_boxes,
+			multimask_output=False
+		)
+		
+		# Convert from tensor to list of numpy arrays
+		# masks shape: [N, 1, H, W] where N = number of boxes
+		masks_np = [
+			mask[0].cpu().numpy().astype(np.uint8) 
+			for mask in masks
+		]
+		
+		return masks_np
+
 	def augment_dataset(
 		self,
 		dataset: Sequence[DatasetItem],
