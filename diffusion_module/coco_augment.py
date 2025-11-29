@@ -471,13 +471,8 @@ def main() -> None:
 			LOGGER.exception("Failed to load image %s: %s", sample.image_path, exc)
 			continue
 		
-		# Random sampling strategy: select up to 3 annotations per image
-		max_patches_per_image = 3
-		target_anns = np.random.choice(
-			annotations,
-			size=min(len(annotations), max_patches_per_image),
-			replace=False
-		)
+		# Process every annotation so each label is augmented
+		target_anns = annotations
 		
 		processed += 1
 		
