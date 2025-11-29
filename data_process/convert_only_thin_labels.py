@@ -16,8 +16,8 @@ import json
 import argparse
 from collections import Counter
 
-KEEP_NAMES = {"thin", "thick", "intermediate"}
-DROP_NAMES = {"tapeResidue", "flakes"}
+KEEP_NAMES = {"thin"}
+DROP_NAMES = {"tapeResidue", "flakes", "thick", "intermediate"}
 SINGLE_CLASS = {"id": 1, "name": "sample"}
 KEEP_ONLY_POSITIVE_IMAGES = False  # 没有正例的图片是否剔除
 

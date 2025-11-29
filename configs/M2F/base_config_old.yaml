@@ -71,8 +71,8 @@ SOLVER:
   #WARMUP_ITERS: 0
 
   # --- 学习率策略核心区 ---
-  BASE_LR: 0.0001  # 初始学习率可以稍微大一点，因为后面会自动下降
-  MAX_ITER: 20000   # 大大增加总训练迭代次数，给模型充分学习的时间
+  BASE_LR: 0.00002  # 初始学习率可以稍微大一点，因为后面会自动下降
+  MAX_ITER: 10000   # 大大增加总训练迭代次数，给模型充分学习的时间
 
   LR_SCHEDULER_NAME: "WarmupCosineLR"
 
@@ -80,21 +80,22 @@ SOLVER:
   WARMUP_FACTOR: 0.001 # 热身从一个很小的值开始
   WARMUP_METHOD: "linear"
   # --- 学习率策略结束 ---
-  WEIGHT_DECAY: 0.01
+  CHECKPOINT_PERIOD: 5000 # 可以设一个检查点，比如每5000次保存一下模型，以防中断
+  WEIGHT_DECAY: 0.05
   OPTIMIZER: "ADAMW"
   CLIP_GRADIENTS:
     ENABLED: True
     CLIP_TYPE: "full_model"
-    CLIP_VALUE: 1.0
+    CLIP_VALUE: 0.01
     NORM_TYPE: 2.0
   AMP:
-    ENABLED: False 
+    ENABLED: False # 如果你的GPU支持，可以设为True来加速训练
   
   #OPTIMIZER: "ADAMW"
   #CLIP_GRADIENTS:
     #ENABLED: True
     #CLIP_TYPE: "full_model"
-    #CLIP_VALUE: 1
+    #CLIP_VALUE: 0.01
     #NORM_TYPE: 2.0
   #AMP:
     #ENABLED: False
@@ -103,27 +104,13 @@ TEST:
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: False
   NUM_WORKERS: 6
-#INPUT:
-#  SIZE_DIVISIBILITY: -1
-#  MASK_FORMAT: "bitmask"
-#  MIN_SIZE_TEST: 0 # disable resizing during testing
-#  FORMAT: "BGR"
-#  CROP:
-#    ENABLED: false
-
 INPUT:
-  MIN_SIZE_TRAIN: (512, 608, 704, 800, 896, 992, 1088, 1184, 1280)
-  MAX_SIZE_TRAIN: 4096
-  MIN_SIZE_TEST: 0
-
-  CROP:
-    ENABLED: True
-    TYPE: "absolute"
-    SIZE: (512, 512)
-  
-  FORMAT: "RGB"
+  SIZE_DIVISIBILITY: -1
   MASK_FORMAT: "bitmask"
-
+  MIN_SIZE_TEST: 0 # disable resizing during testing
+  FORMAT: "BGR"
+  CROP:
+    ENABLED: false
 SEED: 42
 VERSION: 2
 DATASETS:
