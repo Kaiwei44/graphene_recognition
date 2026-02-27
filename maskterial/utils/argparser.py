@@ -140,6 +140,25 @@ def parse_seg_args() -> argparse.Namespace:
         help="Path to the training annotation file, make sure it is in COCO format and the annotations are saved in the RLE format not polygons!",
     )
     parser.add_argument(
+        "--train-mode",
+        type=str,
+        default="normal",
+        choices=["normal", "diffusion"],
+        help="Training data mode for segmentation finetuning.",
+    )
+    parser.add_argument(
+        "--diffusion-train-image-root",
+        type=str,
+        default=None,
+        help="Path to diffusion-augmented training image root (required when --train-mode diffusion).",
+    )
+    parser.add_argument(
+        "--diffusion-train-annotation-path",
+        type=str,
+        default=None,
+        help="Path to diffusion-augmented COCO annotation file (required when --train-mode diffusion).",
+    )
+    parser.add_argument(
         "--dist-url",
         default="auto",
         help="initialization URL for pytorch distributed backend. See "

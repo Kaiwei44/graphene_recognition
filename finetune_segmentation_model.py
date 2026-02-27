@@ -15,6 +15,26 @@ warnings.simplefilter("ignore", UserWarning)
 warnings.simplefilter("ignore", FutureWarning)
 
 
+def resolve_train_data_paths(args):
+    if args.train_mode == "normal":
+        if args.train_image_root is None or args.train_annotation_path is None:
+            raise ValueError(
+                "When --train-mode normal, both --train-image-root and "
+                "--train-annotation-path must be provided."
+            )
+        return args.train_image_root, args.train_annotation_path
+
+    if (
+        args.diffusion_train_image_root is None
+        or args.diffusion_train_annotation_path is None
+    ):
+        raise ValueError(
+            "When --train-mode diffusion, both --diffusion-train-image-root and "
+            "--diffusion-train-annotation-path must be provided."
+        )
+    return args.diffusion_train_image_root, args.diffusion_train_annotation_path
+
+
 def main(args: dict):
     cfg = setup_config(args)
     trainer = MaskTerial_Trainer(
@@ -27,12 +47,15 @@ def main(args: dict):
 
 if __name__ == "__main__":
     args = parse_seg_args()
+    train_image_root, train_annotation_path = resolve_train_data_paths(args)
+    args.train_image_root = train_image_root
+    args.train_annotation_path = train_annotation_path
 
     register_coco_instances(
         "Maskterial_Dataset",
         {},
-        args.train_annotation_path,
-        args.train_image_root,
+        train_annotation_path,
+        train_image_root,
     )
 
     print("Command Line Args:", args)
