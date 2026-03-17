@@ -46,7 +46,7 @@ def main():
     # 2) 注册测试集（你已把测试集合并为单类）
     TEST_NAME = "graphene_test_bin"
     register_coco_instances(TEST_NAME, {}, args.ann, args.image_root)
-    MetadataCatalog.get(TEST_NAME).set(thing_classes=["sample"])  # 仅影响显示名
+    MetadataCatalog.get(TEST_NAME).set(thing_classes=["gra"])  # 仅影响显示名
     meta = MetadataCatalog.get(TEST_NAME)
 
     # 3) 预测与可视化

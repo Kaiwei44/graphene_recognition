@@ -70,7 +70,7 @@ def main():
 
     # 注册测试集（单类）
     register_coco_instances(args.dataset_name, {}, args.ann, args.image_root)
-    MetadataCatalog.get(args.dataset_name).set(thing_classes=["sample"])
+    MetadataCatalog.get(args.dataset_name).set(thing_classes=["gra"])
 
     # cfg：完全复用训练时的 setup_config，只覆盖权重
     cfg = build_cfg_with_setup(args.config_file, args.weights)
