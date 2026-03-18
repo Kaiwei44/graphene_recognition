@@ -53,10 +53,10 @@ MODEL:
       OVERLAP_THRESHOLD: 0.8
       OBJECT_MASK_THRESHOLD: 0.8
   BACKBONE:
-    FREEZE_AT: 3 # freeze the entire backbone
+    FREEZE_AT: 10 # freeze the entire backbone
     NAME: "build_resnet_backbone"
   RESNETS:
-    DEPTH: 50
+    DEPTH: 50  
     STEM_OUT_CHANNELS: 64
     STRIDE_IN_1X1: False
     OUT_FEATURES: ["res2", "res3", "res4", "res5"]
@@ -83,7 +83,6 @@ SOLVER:
   CHECKPOINT_PERIOD: 5000 # 可以设一个检查点，比如每5000次保存一下模型，以防中断
   WEIGHT_DECAY: 0.05
   OPTIMIZER: "ADAMW"
-  BACKBONE_MULTIPLIER: 0.1
   CLIP_GRADIENTS:
     ENABLED: True
     CLIP_TYPE: "full_model"
