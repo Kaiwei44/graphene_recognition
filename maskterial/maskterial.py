@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from detectron2.structures import Boxes, Instances
 
+from .measurements import attach_measurements_to_flake
 from .structures.FlakeClass import Flake
 from .modeling.classification_models import BaseClassificationHead
 from .modeling.postprocessing_models import BasePostprocessingModel
@@ -237,7 +238,7 @@ class MaskTerial:
                 )
             )
 
-        return flakes
+        return [attach_measurements_to_flake(flake) for flake in flakes]
 
     def _inference_with_segmentation_model(
         self,
@@ -254,7 +255,7 @@ class MaskTerial:
         else:
             flakes = self.convert_instances_to_flakes(instances)
 
-        return flakes
+        return [attach_measurements_to_flake(flake) for flake in flakes]
 
     @torch.inference_mode()
     def __call__(self, input: list[dict]) -> list[dict]:
