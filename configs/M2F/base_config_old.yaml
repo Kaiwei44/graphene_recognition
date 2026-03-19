@@ -29,12 +29,12 @@ MODEL:
     TRANSFORMER_DECODER_NAME: "MultiScaleMaskedTransformerDecoder"
     TRANSFORMER_IN_FEATURE: "multi_scale_pixel_decoder"
     DEEP_SUPERVISION: True
-    NO_OBJECT_WEIGHT: 0.1
+    NO_OBJECT_WEIGHT: 0.3
     CLASS_WEIGHT: 2.0
     MASK_WEIGHT: 5.0
     DICE_WEIGHT: 5.0
     HIDDEN_DIM: 256
-    NUM_OBJECT_QUERIES: 100
+    NUM_OBJECT_QUERIES: 20  #100
     NHEADS: 8
     DROPOUT: 0.0
     DIM_FEEDFORWARD: 2048
@@ -72,7 +72,7 @@ SOLVER:
 
   # --- 学习率策略核心区 ---
   BASE_LR: 0.00005  # 初始学习率可以稍微大一点，因为后面会自动下降
-  MAX_ITER: 20000   # 大大增加总训练迭代次数，给模型充分学习的时间
+  MAX_ITER: 15000   # 大大增加总训练迭代次数，给模型充分学习的时间
 
   LR_SCHEDULER_NAME: "WarmupCosineLR"
 
