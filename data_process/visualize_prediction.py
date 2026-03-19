@@ -41,25 +41,34 @@ def draw_area_labels(image, instances, scale: float):
         area = measure_mask_area(mask, pixel_scale)
         text = f"{area.area_um2:.1f} um^2"
         ys, xs = np.nonzero(mask)
-        anchor = (int(xs.mean() * scale), int(ys.mean() * scale))
-        cv2.putText(
-            image,
+        center_x = int(xs.mean() * scale)
+        center_y = int(ys.mean() * scale)
+        text_origin = (center_x + 8, center_y - 8)
+        text_size, baseline = cv2.getTextSize(
             text,
-            anchor,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.7,
+            2,
+        )
+        x0, y0 = text_origin
+        x1 = x0 + text_size[0] + 8
+        y1 = y0 - text_size[1] - 8
+        cv2.circle(image, (center_x, center_y), 4, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.rectangle(
+            image,
+            (x0 - 4, y1),
+            (x1, y0 + baseline + 4),
             (0, 0, 0),
-            3,
-            cv2.LINE_AA,
+            -1,
         )
         cv2.putText(
             image,
             text,
-            anchor,
+            text_origin,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.7,
             (255, 255, 255),
-            1,
+            2,
             cv2.LINE_AA,
         )
 
