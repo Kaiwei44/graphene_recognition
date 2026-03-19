@@ -61,7 +61,7 @@ MODEL:
     STRIDE_IN_1X1: False
     OUT_FEATURES: ["res2", "res3", "res4", "res5"]
 SOLVER:
-  IMS_PER_BATCH: 16
+  IMS_PER_BATCH: 32
  
   #BASE_LR: 0.00001
   #MAX_ITER: 1000 #(500次迭代似乎不能使loss收敛，适当调大)
