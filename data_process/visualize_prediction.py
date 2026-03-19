@@ -4,6 +4,7 @@ import random
 from types import SimpleNamespace
 
 import cv2
+import numpy as np
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
 from detectron2.engine import DefaultPredictor
@@ -28,6 +29,7 @@ def build_cfg(config_file: str, weights: str, extra_opts: list[str]):
 
 
 def draw_area_labels(image, instances):
+    image = np.ascontiguousarray(image)
     masks = instances.pred_masks.numpy()
     boxes = instances.pred_boxes.tensor.numpy()
     image_height_px, image_width_px = masks.shape[1:]
