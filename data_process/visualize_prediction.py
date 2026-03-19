@@ -41,17 +41,16 @@ def draw_area_labels(image, flakes, scale: float):
         text_size, baseline = cv2.getTextSize(
             text,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            2,
+            0.5,
+            1,
         )
         x0, y0 = text_origin
-        x1 = x0 + text_size[0] + 8
-        y1 = y0 - text_size[1] - 8
-        cv2.circle(image, (center_x, center_y), 4, (0, 0, 255), -1, cv2.LINE_AA)
+        x1 = x0 + text_size[0] + 6
+        y1 = y0 - text_size[1] - 6
         cv2.rectangle(
             image,
-            (x0 - 4, y1),
-            (x1, y0 + baseline + 4),
+            (x0 - 3, y1),
+            (x1, y0 + baseline + 3),
             (0, 0, 0),
             -1,
         )
@@ -60,9 +59,9 @@ def draw_area_labels(image, flakes, scale: float):
             text,
             text_origin,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.5,
             (255, 255, 255),
-            2,
+            1,
             cv2.LINE_AA,
         )
 
