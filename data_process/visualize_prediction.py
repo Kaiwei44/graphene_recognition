@@ -160,7 +160,7 @@ def main():
                 fy=args.scale,
                 interpolation=cv2.INTER_LINEAR,
             )
-        pred_img = draw_flake_masks(pred_img, flakes, 1.0)
+        pred_img = draw_flake_masks(pred_img, flakes, args.scale)
         pred_img = draw_area_labels(pred_img, flakes, args.scale)
 
         base = os.path.splitext(os.path.basename(dataset_dict["file_name"]))[0]
