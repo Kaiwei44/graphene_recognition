@@ -18,6 +18,7 @@ class Flake:
         min_sidelength: int,
         false_positive_probability: float = 0,
         entropy: float = -1,
+        measurements=None,
     ):
         """
         Initialize a flake object.
@@ -43,6 +44,7 @@ class Flake:
         self.aspect_ratio = round(max_sidelength / (min_sidelength + 1e-5), 1)
         self.false_positive_probability = false_positive_probability
         self.entropy = entropy
+        self.measurements = measurements
 
     def to_dict(
         self,
@@ -69,6 +71,9 @@ class Flake:
             "entropy": float(self.entropy),
         }
 
+        if self.measurements is not None:
+            temp_dict["measurements"] = self.measurements.to_dict()
+
         # calculate the bbox of the flake from the mask
         if return_bbox:
             rows = np.any(self.mask, axis=1)
@@ -81,8 +86,6 @@ class Flake:
                 int(cmax - cmin),
                 int(rmax - rmin),
             ]
-
-        print(temp_dict)
 
         return temp_dict
 
