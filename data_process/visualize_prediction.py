@@ -28,21 +28,20 @@ def build_cfg(config_file: str, weights: str, extra_opts: list[str]):
     return setup_config(args)
 
 
-def draw_area_labels(image, instances):
+def draw_area_labels(image, instances, scale: float):
     image = np.ascontiguousarray(image)
     masks = instances.pred_masks.numpy()
-    boxes = instances.pred_boxes.tensor.numpy()
     image_height_px, image_width_px = masks.shape[1:]
     pixel_scale = build_pixel_scale(
         image_width_px=image_width_px,
         image_height_px=image_height_px,
     )
 
-    for mask, box in zip(masks, boxes, strict=True):
+    for mask in masks:
         area = measure_mask_area(mask, pixel_scale)
-        x0, y0, _, _ = box.astype(int)
         text = f"{area.area_um2:.1f} um^2"
-        anchor = (x0, y0 - 8)
+        ys, xs = np.nonzero(mask)
+        anchor = (int(xs.mean() * scale), int(ys.mean() * scale))
         cv2.putText(
             image,
             text,
@@ -129,7 +128,7 @@ def main():
         instances = outputs["instances"].to("cpu")
         instances = filter_instances_by_area(instances, args.min_area_um2)
         pred_img = visualizer.draw_instance_predictions(instances).get_image()[:, :, ::-1]
-        pred_img = draw_area_labels(pred_img, instances)
+        pred_img = draw_area_labels(pred_img, instances, args.scale)
 
         base = os.path.splitext(os.path.basename(dataset_dict["file_name"]))[0]
         pred_path = os.path.join(args.outdir, f"{base}_pred.jpg")
