@@ -24,7 +24,7 @@ if __name__ == "__main__":
 
     register_coco_instances(DATASET_NAME, {}, ANN_PATH, IMAGE_DIR)
 
-    seg_model, cls_model, pp_model = load_models(args)
+    seg_model, cls_model, pp_model = load_models(**vars(args))
 
     print("Loading Model...")
     maskterial = MaskTerial(
