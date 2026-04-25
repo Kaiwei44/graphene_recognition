@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import random
+import sys
 from types import SimpleNamespace
 
 import cv2
@@ -16,6 +17,12 @@ from maskterial.maskterial import MaskTerial
 from maskterial.modeling.segmentation_models import M2F_model
 from maskterial.modeling.segmentation_models.M2F import maskformer_model  # noqa: F401
 from maskterial.utils.dataset_functions import setup_config
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from flake_postprocess import GrapheneFlakePostprocessor, PostprocessParams
 
 
 def build_cfg(config_file: str, weights: str, extra_opts: list[str]):
@@ -177,6 +184,23 @@ def write_flake_rows(writer, dataset_dict, flakes):
         )
 
 
+def build_postprocess_params(args) -> PostprocessParams:
+    return PostprocessParams(
+        overlap_iou_threshold=args.pp_overlap_iou_threshold,
+        overlap_containment_threshold=args.pp_overlap_containment_threshold,
+        grow_radius_px=args.pp_grow_radius_px,
+        max_boundary_distance_px=args.pp_max_boundary_distance_px,
+        lab_l_weight=args.pp_lab_l_weight,
+        tau_grow=args.pp_tau_grow,
+        tau_pair=args.pp_tau_pair,
+        grow_sigma=args.pp_grow_sigma,
+        min_bridge_area_px=args.pp_min_bridge_area_px,
+        min_bridge_ratio=args.pp_min_bridge_ratio,
+        final_min_area_um2=args.pp_final_min_area_um2,
+        max_bridge_passes=args.pp_max_bridge_passes,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-file", required=True)
@@ -201,10 +225,26 @@ def main():
     parser.add_argument("--sort-by", choices=["score", "area", "none"], default="score")
     parser.add_argument("--summary-csv", default=None)
     parser.add_argument("--draw-gt", action="store_true")
+    parser.add_argument("--postprocess", action="store_true")
+    parser.add_argument("--postprocess-vis-dir", default=None)
+    parser.add_argument("--pp-overlap-iou-threshold", type=float, default=0.5)
+    parser.add_argument("--pp-overlap-containment-threshold", type=float, default=0.8)
+    parser.add_argument("--pp-grow-radius-px", type=int, default=6)
+    parser.add_argument("--pp-max-boundary-distance-px", type=int, default=8)
+    parser.add_argument("--pp-lab-l-weight", type=float, default=0.5)
+    parser.add_argument("--pp-tau-grow", type=float, default=12.0)
+    parser.add_argument("--pp-tau-pair", type=float, default=12.0)
+    parser.add_argument("--pp-grow-sigma", type=float, default=1.5)
+    parser.add_argument("--pp-min-bridge-area-px", type=float, default=15.0)
+    parser.add_argument("--pp-min-bridge-ratio", type=float, default=0.3)
+    parser.add_argument("--pp-final-min-area-um2", type=float, default=100.0)
+    parser.add_argument("--pp-max-bridge-passes", type=int, default=5)
     parser.add_argument("opts", nargs=argparse.REMAINDER, default=[])
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
+    if args.postprocess_vis_dir is not None:
+        os.makedirs(args.postprocess_vis_dir, exist_ok=True)
     random.seed(args.seed)
 
     cfg = build_cfg(args.config_file, args.weights, args.opts)
@@ -233,6 +273,11 @@ def main():
     else:
         samples = random.sample(dataset_dicts, min(args.num_samples, len(dataset_dicts)))
 
+    use_postprocess = args.postprocess or args.postprocess_vis_dir is not None
+    postprocessor = None
+    if use_postprocess:
+        postprocessor = GrapheneFlakePostprocessor(build_postprocess_params(args))
+
     csv_path = args.summary_csv or os.path.join(args.outdir, "predictions.csv")
     csv_file = open(csv_path, "w", newline="")
     csv_writer = csv.DictWriter(
@@ -258,8 +303,18 @@ def main():
             continue
 
         raw_flakes = maskterial.predict(img)
-        flakes = raw_flakes
-        flakes = filter_flakes_by_area(flakes, args.min_area_um2)
+        base = os.path.splitext(os.path.basename(dataset_dict["file_name"]))[0]
+        if use_postprocess:
+            postprocess_result = postprocessor.run(
+                image_bgr=img,
+                raw_flakes=raw_flakes,
+                debug_vis_dir=args.postprocess_vis_dir,
+                image_stem=base,
+            )
+            flakes = postprocess_result.final_flakes
+        else:
+            flakes = filter_flakes_by_area(raw_flakes, args.min_area_um2)
+
         flakes = sort_flakes(flakes, args.sort_by)
         write_flake_rows(csv_writer, dataset_dict, flakes)
 
@@ -275,12 +330,17 @@ def main():
         pred_img = draw_flake_masks(pred_img, flakes, args.scale)
         pred_img = draw_flake_labels(pred_img, flakes, args.scale, args.label_mode)
 
-        base = os.path.splitext(os.path.basename(dataset_dict["file_name"]))[0]
-        print(
-            f"{base}: predicted {len(raw_flakes)}, drew {len(flakes)} "
-            f"(score>={args.score_threshold}, size>{args.size_threshold_px}px, "
-            f"area>={args.min_area_um2} um^2)"
-        )
+        if use_postprocess:
+            print(
+                f"{base}: raw {len(raw_flakes)}, final {len(flakes)} "
+                f"(postprocess area>={args.pp_final_min_area_um2} um^2)"
+            )
+        else:
+            print(
+                f"{base}: predicted {len(raw_flakes)}, drew {len(flakes)} "
+                f"(score>={args.score_threshold}, size>{args.size_threshold_px}px, "
+                f"area>={args.min_area_um2} um^2)"
+            )
         pred_path = os.path.join(args.outdir, f"{base}_pred.jpg")
         cv2.imwrite(pred_path, pred_img)
 
