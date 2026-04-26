@@ -188,6 +188,7 @@ def build_postprocess_params(args) -> PostprocessParams:
     return PostprocessParams(
         overlap_iou_threshold=args.pp_overlap_iou_threshold,
         overlap_containment_threshold=args.pp_overlap_containment_threshold,
+        enable_bridge_merge=args.pp_enable_bridge_merge,
         grow_radius_px=args.pp_grow_radius_px,
         max_boundary_distance_px=args.pp_max_boundary_distance_px,
         lab_l_weight=args.pp_lab_l_weight,
@@ -229,8 +230,9 @@ def main():
     parser.add_argument("--postprocess-vis-dir", default=None)
     parser.add_argument("--pp-overlap-iou-threshold", type=float, default=0.5)
     parser.add_argument("--pp-overlap-containment-threshold", type=float, default=0.8)
-    parser.add_argument("--pp-grow-radius-px", type=int, default=6)
-    parser.add_argument("--pp-max-boundary-distance-px", type=int, default=8)
+    parser.add_argument("--pp-enable-bridge-merge", action="store_true")
+    parser.add_argument("--pp-grow-radius-px", type=int, default=3)
+    parser.add_argument("--pp-max-boundary-distance-px", type=int, default=3)
     parser.add_argument("--pp-lab-l-weight", type=float, default=0.5)
     parser.add_argument("--pp-tau-grow", type=float, default=12.0)
     parser.add_argument("--pp-tau-pair", type=float, default=12.0)

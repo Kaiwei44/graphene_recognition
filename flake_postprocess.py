@@ -19,6 +19,8 @@ class PostprocessParams:
     overlap_containment_threshold: float = 0.8
 
     # 对于大块被切成小块的情况把小块拼回成大块：
+    # 是否启用 Lab 颜色约束的近邻 bridge merge；默认关闭，避免相邻 flake 被误粘连。
+    enable_bridge_merge: bool = False
     # 颜色约束外扩的半径，单位是像素；值越大，可检测到的断裂间隙越宽。
     grow_radius_px: int = 3
     # 两个 mask 边界距离不超过该值时，才会进入 bridge merge 候选。
@@ -103,7 +105,10 @@ class GrapheneFlakePostprocessor:
         raw_candidates = self._to_candidates(raw_flakes)
 
         overlap_candidates = self._merge_overlaps(raw_candidates)
-        bridge_candidates = self._merge_bridges(overlap_candidates)
+        if self.params.enable_bridge_merge:
+            bridge_candidates = self._merge_bridges(overlap_candidates)
+        else:
+            bridge_candidates = list(overlap_candidates)
         final_candidates = [
             candidate
             for candidate in bridge_candidates
