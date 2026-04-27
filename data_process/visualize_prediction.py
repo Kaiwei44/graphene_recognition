@@ -198,6 +198,7 @@ def build_postprocess_params(args) -> PostprocessParams:
         min_bridge_area_px=args.pp_min_bridge_area_px,
         min_bridge_ratio=args.pp_min_bridge_ratio,
         final_min_area_um2=args.pp_final_min_area_um2,
+        final_min_score=args.pp_final_min_score,
         max_bridge_passes=args.pp_max_bridge_passes,
     )
 
@@ -240,6 +241,7 @@ def main():
     parser.add_argument("--pp-min-bridge-area-px", type=float, default=15.0)
     parser.add_argument("--pp-min-bridge-ratio", type=float, default=0.3)
     parser.add_argument("--pp-final-min-area-um2", type=float, default=100.0)
+    parser.add_argument("--pp-final-min-score", type=float, default=0.015)
     parser.add_argument("--pp-max-bridge-passes", type=int, default=5)
     parser.add_argument("opts", nargs=argparse.REMAINDER, default=[])
     args = parser.parse_args()
@@ -335,7 +337,8 @@ def main():
         if use_postprocess:
             print(
                 f"{base}: raw {len(raw_flakes)}, final {len(flakes)} "
-                f"(postprocess area>={args.pp_final_min_area_um2} um^2)"
+                f"(postprocess score>={args.pp_final_min_score}, "
+                f"area>={args.pp_final_min_area_um2} um^2)"
             )
         else:
             print(

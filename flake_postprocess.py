@@ -39,6 +39,8 @@ class PostprocessParams:
     min_bridge_ratio: float = 0.3
     # 所有合并完成后，再删除面积小于该值的 flake，单位 um^2。
     final_min_area_um2: float = 100.0
+    # 所有合并完成后，再删除最终 score 小于该值的 flake。
+    final_min_score: float = 0.015
     # bridge merge 的最大迭代轮数；每轮合并后会重新计算 mask 和 Lab median。
     max_bridge_passes: int = 5
 
@@ -112,7 +114,8 @@ class GrapheneFlakePostprocessor:
         final_candidates = [
             candidate
             for candidate in bridge_candidates
-            if candidate.flake.measurements.area_um2 >= self.params.final_min_area_um2
+            if candidate.score >= self.params.final_min_score
+            and candidate.flake.measurements.area_um2 >= self.params.final_min_area_um2
         ]
 
         result = PostprocessResult(
