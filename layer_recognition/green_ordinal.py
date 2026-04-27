@@ -13,14 +13,16 @@ from typing import Iterable
 import cv2
 import joblib
 import numpy as np
-from pycocotools import mask as mask_utils
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import HuberRegressor, Ridge
+from sklearn.linear_model import Ridge
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, mean_absolute_error
 from sklearn.model_selection import GroupKFold, StratifiedKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
+
+try:
+    from pycocotools import mask as mask_utils
+except Exception:  # pragma: no cover
+    mask_utils = None
 
 try:
     from sklearn.model_selection import StratifiedGroupKFold
@@ -30,21 +32,16 @@ except Exception:  # pragma: no cover
 
 VALID_LAYERS = np.array([1, 2, 3, 4, 6, 7, 8], dtype=np.int64)
 
-DEFAULT_FEATURE_COLS = [
-    "ndg",
-    "delta_g",
-    "abs_delta_g",
-    "g_flake_median",
-    "g_bg_plane_median",
-    "g_delta_p10",
-    "g_delta_p90",
-    "g_delta_iqr",
-    "g_bg_std",
-    "g_flake_std",
-    "wb1",
-    "wb2",
-    "wb_product",
-    "wb_sum",
+COMPACT_BASE_FEATURES = ["ndg", "iqr_ndg", "wb1", "wb2"]
+
+COMPACT_PHI_FEATURES = [
+    "z_ndg",
+    "z_ndg2",
+    "z_iqr",
+    "z_wb1",
+    "z_wb2",
+    "z_ndg_wb1",
+    "z_ndg_wb2",
 ]
 
 
@@ -86,11 +83,173 @@ class GreenFeatureRow:
     g_delta_p10: float
     g_delta_p90: float
     g_delta_iqr: float
+    iqr_ndg: float
     g_bg_std: float
     g_flake_std: float
     plane_a: float
     plane_b: float
     plane_c: float
+
+
+class CompactOrdinalRidge:
+    """
+    Compact Green Ordinal Ridge, Version B.
+
+    Base features:
+        ndg, iqr_ndg, wb1, wb2
+
+    After standardization, fixed feature map:
+        z_ndg
+        z_ndg^2
+        z_iqr
+        z_wb1
+        z_wb2
+        z_ndg * z_wb1
+        z_ndg * z_wb2
+
+    Learned parameters:
+        8 ridge parameters: intercept + 7 coefficients
+        6 median-calibrated ordinal thresholds
+    """
+
+    def __init__(self, alpha: float = 10.0, random_state: int = 42):
+        self.alpha = float(alpha)
+        self.random_state = int(random_state)
+        self.feature_medians_: np.ndarray | None = None
+        self.scaler_: StandardScaler | None = None
+        self.model_: Ridge | None = None
+        self.thresholds_: np.ndarray | None = None
+        self.train_medians_: dict[int, float] | None = None
+
+    @staticmethod
+    def _base_matrix(rows: list[dict]) -> np.ndarray:
+        return np.asarray(
+            [[float(row.get(col, float("nan"))) for col in COMPACT_BASE_FEATURES] for row in rows],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _fill_nan_with_medians(x: np.ndarray, medians: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64).copy()
+        for j in range(x.shape[1]):
+            bad = ~np.isfinite(x[:, j])
+            if np.any(bad):
+                x[bad, j] = medians[j]
+        return x
+
+    @staticmethod
+    def _phi_from_z(z: np.ndarray) -> np.ndarray:
+        z_ndg = z[:, 0]
+        z_iqr = z[:, 1]
+        z_wb1 = z[:, 2]
+        z_wb2 = z[:, 3]
+        return np.column_stack(
+            [
+                z_ndg,
+                z_ndg**2,
+                z_iqr,
+                z_wb1,
+                z_wb2,
+                z_ndg * z_wb1,
+                z_ndg * z_wb2,
+            ]
+        )
+
+    def _make_phi_train(self, rows: list[dict]) -> np.ndarray:
+        x = self._base_matrix(rows)
+        self.feature_medians_ = np.nanmedian(np.where(np.isfinite(x), x, np.nan), axis=0)
+        self.feature_medians_ = np.where(np.isfinite(self.feature_medians_), self.feature_medians_, 0.0)
+        x = self._fill_nan_with_medians(x, self.feature_medians_)
+        self.scaler_ = StandardScaler()
+        z = self.scaler_.fit_transform(x)
+        return self._phi_from_z(z)
+
+    def _make_phi_predict(self, rows: list[dict]) -> np.ndarray:
+        if self.feature_medians_ is None or self.scaler_ is None:
+            raise RuntimeError("Model has not been fitted")
+        x = self._base_matrix(rows)
+        x = self._fill_nan_with_medians(x, self.feature_medians_)
+        z = self.scaler_.transform(x)
+        return self._phi_from_z(z)
+
+    @staticmethod
+    def _fit_thresholds(scores: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, dict[int, float]]:
+        medians = {}
+        med_list = []
+        for layer in VALID_LAYERS:
+            vals = scores[y == layer]
+            med = float(np.median(vals)) if vals.size else float(layer)
+            medians[int(layer)] = med
+            med_list.append(med)
+
+        med_arr = np.asarray(med_list, dtype=np.float64)
+        if np.any(~np.isfinite(med_arr)) or np.any(np.diff(med_arr) <= 1e-8):
+            thresholds = (VALID_LAYERS[:-1] + VALID_LAYERS[1:]) / 2.0
+        else:
+            thresholds = (med_arr[:-1] + med_arr[1:]) / 2.0
+        return thresholds.astype(np.float64), medians
+
+    @staticmethod
+    def _predict_from_scores(scores: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+        indices = np.searchsorted(thresholds, scores, side="right")
+        indices = np.clip(indices, 0, len(VALID_LAYERS) - 1)
+        return VALID_LAYERS[indices]
+
+    def fit(self, rows: list[dict]) -> CompactOrdinalRidge:
+        y = labels(rows)
+        phi = self._make_phi_train(rows)
+        sample_weight = compute_sample_weight(class_weight="balanced", y=y)
+        self.model_ = Ridge(alpha=self.alpha, random_state=self.random_state)
+        self.model_.fit(phi, y, sample_weight=sample_weight)
+        train_scores = self.model_.predict(phi)
+        self.thresholds_, self.train_medians_ = self._fit_thresholds(train_scores, y)
+        return self
+
+    def score_samples(self, rows: list[dict]) -> np.ndarray:
+        if self.model_ is None:
+            raise RuntimeError("Model has not been fitted")
+        return self.model_.predict(self._make_phi_predict(rows))
+
+    def predict(self, rows: list[dict]) -> np.ndarray:
+        if self.thresholds_ is None:
+            raise RuntimeError("Model thresholds are unavailable")
+        return self._predict_from_scores(self.score_samples(rows), self.thresholds_)
+
+    def review_flags(self, rows: list[dict], boundary_margin: float) -> np.ndarray:
+        if self.thresholds_ is None:
+            raise RuntimeError("Model thresholds are unavailable")
+        scores = self.score_samples(rows)
+        boundary_distance = np.min(np.abs(scores[:, None] - self.thresholds_[None, :]), axis=1)
+        near_boundary = boundary_distance < boundary_margin
+        missing_five_zone = (scores >= 4.5) & (scores <= 5.5)
+        return near_boundary | missing_five_zone
+
+    def coefficient_rows(self) -> list[dict]:
+        if self.model_ is None:
+            raise RuntimeError("Model has not been fitted")
+        rows = [{"feature": "intercept", "coef": float(self.model_.intercept_)}]
+        for name, coef in zip(COMPACT_PHI_FEATURES, self.model_.coef_.ravel()):
+            rows.append({"feature": name, "coef": float(coef)})
+        return rows
+
+    def config(self) -> dict:
+        return {
+            "model_name": "Compact Green Ordinal Ridge Version B",
+            "alpha": self.alpha,
+            "base_features": COMPACT_BASE_FEATURES,
+            "phi_features": COMPACT_PHI_FEATURES,
+            "classes": VALID_LAYERS.tolist(),
+            "thresholds": self.thresholds_.tolist() if self.thresholds_ is not None else None,
+            "train_score_medians": self.train_medians_,
+            "feature_medians": self.feature_medians_.tolist() if self.feature_medians_ is not None else None,
+            "no_area_features_used": True,
+            "no_full_polynomial_features": True,
+        }
+
+
+# -----------------------------
+# Path, parsing, and COCO utilities
+# -----------------------------
 
 
 def expand_path(path: str | os.PathLike) -> Path:
@@ -115,8 +274,6 @@ def parse_group_from_filename(filename: str) -> str:
     stem = Path(filename).stem
     if ".rf." in stem:
         stem = stem.split(".rf.", 1)[0]
-
-    # For names like 1-7-3-9-6-10-6_png, drop the first four numeric WB blocks.
     parts = re.split(r"([_-])", stem)
     numeric_seen = 0
     output = []
@@ -180,6 +337,8 @@ def ann_to_mask(annotation: dict, height: int, width: int) -> np.ndarray:
         return mask.astype(bool)
 
     if isinstance(segmentation, dict):
+        if mask_utils is None:
+            raise ImportError("RLE segmentation requires pycocotools. Run: pip install pycocotools")
         rle = segmentation
         if isinstance(rle.get("counts"), list):
             rle = mask_utils.frPyObjects(rle, height, width)
@@ -189,6 +348,11 @@ def ann_to_mask(annotation: dict, height: int, width: int) -> np.ndarray:
         return decoded.astype(bool)
 
     raise ValueError(f"Unsupported segmentation type: {type(segmentation)}")
+
+
+# -----------------------------
+# Feature extraction
+# -----------------------------
 
 
 def trimmed_mean(values: np.ndarray, low: float = 10.0, high: float = 90.0) -> float:
@@ -203,12 +367,7 @@ def trimmed_mean(values: np.ndarray, low: float = 10.0, high: float = 90.0) -> f
     return float(np.mean(trimmed))
 
 
-def robust_plane_fit(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    values: np.ndarray,
-    sample_max: int,
-) -> tuple[float, float, float]:
+def robust_plane_fit(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, sample_max: int) -> tuple[float, float, float]:
     xs = xs.astype(np.float32)
     ys = ys.astype(np.float32)
     values = values.astype(np.float32)
@@ -231,12 +390,7 @@ def robust_plane_fit(
     return float(coefs[0]), float(coefs[1]), float(coefs[2])
 
 
-def extract_one_annotation_features(
-    image_bgr: np.ndarray,
-    annotation_mask: np.ndarray,
-    union_mask: np.ndarray,
-    cfg: ExtractConfig,
-) -> dict | None:
+def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.ndarray, union_mask: np.ndarray, cfg: ExtractConfig) -> dict | None:
     height, width = annotation_mask.shape
     area_px = int(np.count_nonzero(annotation_mask))
     if area_px < cfg.min_area_px:
@@ -283,6 +437,8 @@ def extract_one_annotation_features(
     delta_g = trimmed_mean(delta_values, cfg.trim_low, cfg.trim_high)
     ndg = delta_g / max(abs(g_bg_plane_median), 1.0)
     p10, p90 = np.percentile(delta_values, [10, 90])
+    g_delta_iqr = float(p90 - p10)
+    iqr_ndg = g_delta_iqr / max(abs(g_bg_plane_median), 1.0)
 
     return {
         "area_px": area_px,
@@ -298,7 +454,8 @@ def extract_one_annotation_features(
         "g_bg_plane_median": g_bg_plane_median,
         "g_delta_p10": float(p10),
         "g_delta_p90": float(p90),
-        "g_delta_iqr": float(p90 - p10),
+        "g_delta_iqr": g_delta_iqr,
+        "iqr_ndg": float(iqr_ndg),
         "g_bg_std": float(np.std(bg_values)),
         "g_flake_std": float(np.std(flake_values)),
         "plane_a": float(a),
@@ -307,12 +464,7 @@ def extract_one_annotation_features(
     }
 
 
-def read_split_features(
-    split: str,
-    image_dir: str | os.PathLike,
-    coco_path: str | os.PathLike,
-    cfg: ExtractConfig,
-) -> list[GreenFeatureRow]:
+def read_split_features(split: str, image_dir: str | os.PathLike, coco_path: str | os.PathLike, cfg: ExtractConfig) -> list[GreenFeatureRow]:
     image_dir = expand_path(image_dir)
     coco_dict = load_coco(coco_path)
     category_to_layer = build_category_to_layer(coco_dict)
@@ -339,9 +491,10 @@ def read_split_features(
 
         decoded: list[tuple[dict, int, np.ndarray]] = []
         union_mask = np.zeros((height, width), dtype=bool)
+        valid_or_missing_five = set(VALID_LAYERS.tolist() + [5])
         for annotation in annotations:
             layer = category_to_layer.get(int(annotation.get("category_id", -1)))
-            if layer is None or layer not in set(VALID_LAYERS.tolist() + [5]):
+            if layer is None or layer not in valid_or_missing_five:
                 continue
             mask = ann_to_mask(annotation, height, width)
             if int(np.count_nonzero(mask)) < cfg.min_area_px:
@@ -360,21 +513,22 @@ def read_split_features(
             feature_values = extract_one_annotation_features(image_bgr, mask, union_mask, cfg)
             if feature_values is None:
                 continue
-            row = GreenFeatureRow(
-                split=split,
-                filename=Path(file_name).name,
-                image_path=str(image_path),
-                image_id=int(image_id),
-                ann_id=int(annotation.get("id", -1)),
-                layer=int(layer),
-                group=group,
-                wb1=float(wb1),
-                wb2=float(wb2),
-                wb_product=float(wb1 * wb2) if np.isfinite(wb1) and np.isfinite(wb2) else float("nan"),
-                wb_sum=float(wb1 + wb2) if np.isfinite(wb1) and np.isfinite(wb2) else float("nan"),
-                **feature_values,
+            rows.append(
+                GreenFeatureRow(
+                    split=split,
+                    filename=Path(file_name).name,
+                    image_path=str(image_path),
+                    image_id=int(image_id),
+                    ann_id=int(annotation.get("id", -1)),
+                    layer=int(layer),
+                    group=group,
+                    wb1=float(wb1),
+                    wb2=float(wb2),
+                    wb_product=float(wb1 * wb2) if np.isfinite(wb1) and np.isfinite(wb2) else float("nan"),
+                    wb_sum=float(wb1 + wb2) if np.isfinite(wb1) and np.isfinite(wb2) else float("nan"),
+                    **feature_values,
+                )
             )
-            rows.append(row)
 
         if image_index % 25 == 0:
             print(f"[{split}] processed {image_index}/{len(items)} images, features={len(rows)}")
@@ -425,6 +579,11 @@ def extract_features(
     return all_rows
 
 
+# -----------------------------
+# CSV and row utilities
+# -----------------------------
+
+
 def rows_to_dicts(rows: Iterable[GreenFeatureRow]) -> list[dict]:
     return [asdict(row) for row in rows]
 
@@ -452,21 +611,23 @@ def coerce_rows(rows: list[dict]) -> list[dict]:
         converted = dict(row)
         for column in numeric_columns:
             if column in converted:
-                converted[column] = float(converted[column])
-        converted["image_id"] = int(converted["image_id"])
-        converted["ann_id"] = int(converted["ann_id"])
+                try:
+                    converted[column] = float(converted[column])
+                except Exception:
+                    converted[column] = float("nan")
+
+        if "iqr_ndg" not in converted or not np.isfinite(float(converted.get("iqr_ndg", float("nan")))):
+            g_delta_iqr = float(converted.get("g_delta_iqr", float("nan")))
+            g_bg = abs(float(converted.get("g_bg_plane_median", float("nan"))))
+            converted["iqr_ndg"] = g_delta_iqr / max(g_bg, 1.0) if np.isfinite(g_delta_iqr) and np.isfinite(g_bg) else float("nan")
+
+        converted["image_id"] = int(float(converted.get("image_id", -1)))
+        converted["ann_id"] = int(float(converted.get("ann_id", -1)))
         converted["layer"] = int(float(converted["layer"]))
-        converted["area_px"] = int(float(converted["area_px"]))
-        converted["roi_bg_pixels"] = int(float(converted["roi_bg_pixels"]))
+        converted["area_px"] = int(float(converted.get("area_px", 0)))
+        converted["roi_bg_pixels"] = int(float(converted.get("roi_bg_pixels", 0)))
         output.append(converted)
     return output
-
-
-def feature_matrix(rows: list[dict], feature_cols: list[str]) -> np.ndarray:
-    matrix = []
-    for row in rows:
-        matrix.append([float(row.get(column, float("nan"))) for column in feature_cols])
-    return np.asarray(matrix, dtype=np.float64)
 
 
 def labels(rows: list[dict]) -> np.ndarray:
@@ -477,52 +638,27 @@ def groups(rows: list[dict]) -> np.ndarray:
     return np.asarray([str(row["group"]) for row in rows])
 
 
-def make_model(regressor: str, degree: int, ridge_alpha: float, huber_alpha: float, huber_epsilon: float) -> Pipeline:
-    if regressor == "ridge":
-        model = Ridge(alpha=ridge_alpha)
-    elif regressor == "huber":
-        model = HuberRegressor(epsilon=huber_epsilon, alpha=huber_alpha, max_iter=1000)
-    else:
-        raise ValueError(f"Unknown regressor: {regressor}")
-    return Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scale1", StandardScaler()),
-            ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
-            ("scale2", StandardScaler()),
-            ("model", model),
-        ]
-    )
+def class_counts(rows: list[dict]) -> dict[str, int]:
+    return {str(k): int(v) for k, v in sorted(Counter(int(row["layer"]) for row in rows).items())}
 
 
-def fit_thresholds(scores: np.ndarray, y: np.ndarray, classes: np.ndarray = VALID_LAYERS) -> np.ndarray:
-    medians = []
-    for layer in classes:
-        values = scores[y == layer]
-        medians.append(float(np.median(values)) if values.size else float(layer))
-    medians = np.asarray(medians, dtype=np.float64)
-    if np.any(~np.isfinite(medians)) or np.any(np.diff(medians) <= 1e-6):
-        return (classes[:-1] + classes[1:]) / 2.0
-    thresholds = (medians[:-1] + medians[1:]) / 2.0
-    if np.any(np.diff(thresholds) <= 1e-6):
-        return (classes[:-1] + classes[1:]) / 2.0
-    return thresholds
+def split_counts(rows: list[dict]) -> dict[str, dict[str, int]]:
+    output: dict[str, dict[str, int]] = {}
+    for split in sorted({str(row["split"]) for row in rows}):
+        output[split] = class_counts([row for row in rows if row["split"] == split])
+    return output
 
 
-def predict_from_scores(scores: np.ndarray, thresholds: np.ndarray, classes: np.ndarray = VALID_LAYERS) -> np.ndarray:
-    indices = np.searchsorted(thresholds, scores, side="right")
-    indices = np.clip(indices, 0, len(classes) - 1)
-    return classes[indices]
+def write_json(payload: dict, path: str | os.PathLike) -> None:
+    path = expand_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
-def review_flags(scores: np.ndarray, thresholds: np.ndarray, boundary_margin: float) -> np.ndarray:
-    if thresholds.size:
-        boundary_distance = np.min(np.abs(scores[:, None] - thresholds[None, :]), axis=1)
-        near_boundary = boundary_distance < boundary_margin
-    else:
-        near_boundary = np.zeros_like(scores, dtype=bool)
-    missing_five_zone = (scores >= 4.5) & (scores <= 5.5)
-    return near_boundary | missing_five_zone
+# -----------------------------
+# Metrics, training, and run modes
+# -----------------------------
 
 
 def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, review: np.ndarray | None = None) -> dict:
@@ -548,66 +684,6 @@ def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, review: np.ndar
     return metrics
 
 
-def class_counts(rows: list[dict]) -> dict[str, int]:
-    return {str(k): int(v) for k, v in sorted(Counter(int(row["layer"]) for row in rows).items())}
-
-
-def split_counts(rows: list[dict]) -> dict[str, dict[str, int]]:
-    output: dict[str, dict[str, int]] = {}
-    for split in sorted({str(row["split"]) for row in rows}):
-        output[split] = class_counts([row for row in rows if row["split"] == split])
-    return output
-
-
-def select_feature_cols(rows: list[dict], requested: list[str]) -> list[str]:
-    available = set(rows[0].keys()) if rows else set()
-    selected = [column for column in requested if column in available]
-    missing = [column for column in requested if column not in available]
-    if missing:
-        print(f"[WARN] Ignoring missing feature columns: {missing}")
-    if not selected:
-        raise ValueError("No valid feature columns selected")
-    return selected
-
-
-def train_and_predict(
-    train_rows: list[dict],
-    test_rows: list[dict],
-    feature_cols: list[str],
-    regressor: str,
-    degree: int,
-    ridge_alpha: float,
-    huber_alpha: float,
-    huber_epsilon: float,
-    boundary_margin: float,
-) -> tuple[Pipeline, np.ndarray, list[dict], dict]:
-    x_train = feature_matrix(train_rows, feature_cols)
-    y_train = labels(train_rows)
-    x_test = feature_matrix(test_rows, feature_cols)
-    y_test = labels(test_rows)
-
-    pipeline = make_model(regressor, degree, ridge_alpha, huber_alpha, huber_epsilon)
-    sample_weight = compute_sample_weight(class_weight="balanced", y=y_train)
-    pipeline.fit(x_train, y_train, model__sample_weight=sample_weight)
-
-    train_scores = pipeline.predict(x_train)
-    thresholds = fit_thresholds(train_scores, y_train)
-    scores = pipeline.predict(x_test)
-    pred = predict_from_scores(scores, thresholds)
-    review = review_flags(scores, thresholds, boundary_margin)
-
-    prediction_rows = []
-    for row, score, predicted, should_review in zip(test_rows, scores, pred, review):
-        pred_row = dict(row)
-        pred_row["score"] = float(score)
-        pred_row["pred_layer"] = int(predicted)
-        pred_row["review"] = bool(should_review)
-        pred_row["abs_error"] = float(abs(int(row["layer"]) - int(predicted)))
-        prediction_rows.append(pred_row)
-
-    return pipeline, thresholds, prediction_rows, evaluate_predictions(y_test, pred, review)
-
-
 def confusion_rows(y_true: np.ndarray, y_pred: np.ndarray) -> list[dict]:
     matrix = confusion_matrix(y_true, y_pred, labels=VALID_LAYERS)
     rows = []
@@ -619,13 +695,6 @@ def confusion_rows(y_true: np.ndarray, y_pred: np.ndarray) -> list[dict]:
     return rows
 
 
-def write_json(payload: dict, path: str | os.PathLike) -> None:
-    path = expand_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-
-
 def print_metrics(title: str, metrics: dict) -> None:
     print(f"\n[{title}]")
     for key, value in metrics.items():
@@ -635,15 +704,82 @@ def print_metrics(title: str, metrics: dict) -> None:
             print(f"  {key}: {value}")
 
 
+def evaluate_model(model: CompactOrdinalRidge, test_rows: list[dict], boundary_margin: float) -> tuple[list[dict], dict]:
+    y_true = labels(test_rows)
+    scores = model.score_samples(test_rows)
+    pred = model.predict(test_rows)
+    review = model.review_flags(test_rows, boundary_margin=boundary_margin)
+    metrics = evaluate_predictions(y_true, pred, review)
+
+    prediction_rows = []
+    for row, score, predicted, should_review in zip(test_rows, scores, pred, review):
+        pred_row = dict(row)
+        pred_row["score"] = float(score)
+        pred_row["pred_layer"] = int(predicted)
+        pred_row["review"] = bool(should_review)
+        pred_row["abs_error"] = float(abs(int(row["layer"]) - int(predicted)))
+        prediction_rows.append(pred_row)
+    return prediction_rows, metrics
+
+
+def parse_alpha_grid(text: str) -> list[float]:
+    return [float(item.strip()) for item in text.split(",") if item.strip()]
+
+
+def tune_alpha_on_rows(rows: list[dict], alphas: list[float], folds: int, seed: int, boundary_margin: float) -> tuple[float, list[dict]]:
+    y = labels(rows)
+    min_class_count = min(Counter(y.tolist()).values())
+    n_splits = max(2, min(folds, min_class_count))
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    tuning_rows = []
+    for alpha in alphas:
+        fold_metrics = []
+        for fold, (train_idx, valid_idx) in enumerate(splitter.split(np.zeros(len(rows)), y), start=1):
+            train_rows = [rows[int(index)] for index in train_idx]
+            valid_rows = [rows[int(index)] for index in valid_idx]
+            model = CompactOrdinalRidge(alpha=alpha, random_state=seed).fit(train_rows)
+            _, metrics = evaluate_model(model, valid_rows, boundary_margin=boundary_margin)
+            fold_metrics.append(metrics)
+
+        row = {"alpha": float(alpha), "folds": int(n_splits)}
+        for key in ["exact_acc", "within1_acc", "mae", "macro_f1", "review_rate", "kept_exact_acc"]:
+            values = [m[key] for m in fold_metrics if key in m and np.isfinite(m[key])]
+            row[f"cv_{key}"] = float(np.mean(values)) if values else float("nan")
+        tuning_rows.append(row)
+
+    tuning_rows = sorted(tuning_rows, key=lambda r: (-r["cv_macro_f1"], r["cv_mae"], -r["cv_exact_acc"], r["alpha"]))
+    return float(tuning_rows[0]["alpha"]), tuning_rows
+
+
+def fit_compact_model(
+    train_rows: list[dict],
+    tune: bool,
+    alpha: float,
+    alpha_grid: list[float],
+    folds: int,
+    seed: int,
+    boundary_margin: float,
+    tuning_csv_path: Path | None = None,
+) -> tuple[CompactOrdinalRidge, float]:
+    if tune:
+        alpha, tuning_rows = tune_alpha_on_rows(train_rows, alpha_grid, folds, seed, boundary_margin)
+        if tuning_csv_path is not None:
+            write_csv(tuning_rows, tuning_csv_path)
+        print(f"[INFO] Best alpha from train-only CV: {alpha}")
+
+    model = CompactOrdinalRidge(alpha=alpha, random_state=seed).fit(train_rows)
+    return model, alpha
+
+
 def run_roboflow_test(
     rows: list[dict],
-    feature_cols: list[str],
     out_dir: Path,
-    regressor: str,
-    degree: int,
-    ridge_alpha: float,
-    huber_alpha: float,
-    huber_epsilon: float,
+    tune: bool,
+    alpha: float,
+    alpha_grid: list[float],
+    folds: int,
+    seed: int,
     boundary_margin: float,
     args_payload: dict,
 ) -> None:
@@ -652,49 +788,42 @@ def run_roboflow_test(
     if not train_rows or not test_rows:
         raise RuntimeError("roboflow_test mode requires non-empty train/valid and test splits")
 
-    model, thresholds, prediction_rows, metrics = train_and_predict(
-        train_rows,
-        test_rows,
-        feature_cols,
-        regressor,
-        degree,
-        ridge_alpha,
-        huber_alpha,
-        huber_epsilon,
-        boundary_margin,
+    model, alpha = fit_compact_model(
+        train_rows=train_rows,
+        tune=tune,
+        alpha=alpha,
+        alpha_grid=alpha_grid,
+        folds=folds,
+        seed=seed,
+        boundary_margin=boundary_margin,
+        tuning_csv_path=out_dir / "alpha_tuning_train_cv.csv" if tune else None,
     )
-    print_metrics("Roboflow test", metrics)
-    print(f"[INFO] thresholds: {thresholds}")
+
+    prediction_rows, metrics = evaluate_model(model, test_rows, boundary_margin=boundary_margin)
+    print_metrics("Compact ordinal ridge Roboflow test", metrics)
+    print(f"[INFO] alpha: {alpha}")
+    print(f"[INFO] thresholds: {model.thresholds_}")
+    print(f"[INFO] train score medians: {model.train_medians_}")
 
     write_csv(prediction_rows, out_dir / "test_predictions.csv")
     y_true = labels(prediction_rows)
     y_pred = np.asarray([int(row["pred_layer"]) for row in prediction_rows], dtype=np.int64)
     write_csv(confusion_rows(y_true, y_pred), out_dir / "test_confusion_matrix.csv")
+    write_csv(model.coefficient_rows(), out_dir / "coefficients.csv")
     write_json(metrics, out_dir / "test_metrics.json")
-    joblib.dump(
-        {
-            "model": model,
-            "thresholds": thresholds,
-            "classes": VALID_LAYERS,
-            "feature_cols": feature_cols,
-            "args": args_payload,
-        },
-        out_dir / "green_ordinal_model.joblib",
-    )
+    write_json(model.config() | {"args": args_payload}, out_dir / "model_config.json")
+    joblib.dump(model, out_dir / "green_ordinal_model.joblib")
     print(f"[INFO] Saved model: {out_dir / 'green_ordinal_model.joblib'}")
 
 
 def run_cv(
     rows: list[dict],
-    feature_cols: list[str],
     out_dir: Path,
     folds: int,
     seed: int,
-    regressor: str,
-    degree: int,
-    ridge_alpha: float,
-    huber_alpha: float,
-    huber_epsilon: float,
+    tune: bool,
+    alpha: float,
+    alpha_grid: list[float],
     boundary_margin: float,
 ) -> None:
     y = labels(rows)
@@ -721,21 +850,22 @@ def run_cv(
     for fold, (train_idx, test_idx) in enumerate(split_iter, start=1):
         train_rows = [rows[int(index)] for index in train_idx]
         test_rows = [rows[int(index)] for index in test_idx]
-        _, thresholds, prediction_rows, metrics = train_and_predict(
-            train_rows,
-            test_rows,
-            feature_cols,
-            regressor,
-            degree,
-            ridge_alpha,
-            huber_alpha,
-            huber_epsilon,
-            boundary_margin,
+        model, fold_alpha = fit_compact_model(
+            train_rows=train_rows,
+            tune=tune,
+            alpha=alpha,
+            alpha_grid=alpha_grid,
+            folds=folds,
+            seed=seed,
+            boundary_margin=boundary_margin,
+            tuning_csv_path=None,
         )
+        prediction_rows, metrics = evaluate_model(model, test_rows, boundary_margin=boundary_margin)
         for row in prediction_rows:
             row["fold"] = fold
         metrics["fold"] = fold
-        metrics["thresholds"] = ",".join(f"{value:.6g}" for value in thresholds)
+        metrics["alpha"] = fold_alpha
+        metrics["thresholds"] = ",".join(f"{value:.6g}" for value in model.thresholds_)
         fold_metrics.append(metrics)
         all_predictions.extend(prediction_rows)
         print_metrics(f"Fold {fold}", metrics)
@@ -753,38 +883,31 @@ def run_cv(
 
 def run_final(
     rows: list[dict],
-    feature_cols: list[str],
     out_dir: Path,
-    regressor: str,
-    degree: int,
-    ridge_alpha: float,
-    huber_alpha: float,
-    huber_epsilon: float,
+    tune: bool,
+    alpha: float,
+    alpha_grid: list[float],
+    folds: int,
+    seed: int,
     boundary_margin: float,
     args_payload: dict,
 ) -> None:
-    model, thresholds, prediction_rows, metrics = train_and_predict(
-        rows,
-        rows,
-        feature_cols,
-        regressor,
-        degree,
-        ridge_alpha,
-        huber_alpha,
-        huber_epsilon,
-        boundary_margin,
+    model, alpha = fit_compact_model(
+        train_rows=rows,
+        tune=tune,
+        alpha=alpha,
+        alpha_grid=alpha_grid,
+        folds=folds,
+        seed=seed,
+        boundary_margin=boundary_margin,
+        tuning_csv_path=out_dir / "alpha_tuning_final_cv.csv" if tune else None,
     )
+    prediction_rows, metrics = evaluate_model(model, rows, boundary_margin=boundary_margin)
     print_metrics("Final self-fit, not validation", metrics)
     write_csv(prediction_rows, out_dir / "trainset_self_predictions.csv")
+    write_csv(model.coefficient_rows(), out_dir / "coefficients.csv")
     write_json(metrics, out_dir / "final_self_metrics.json")
-    joblib.dump(
-        {
-            "model": model,
-            "thresholds": thresholds,
-            "classes": VALID_LAYERS,
-            "feature_cols": feature_cols,
-            "args": args_payload,
-        },
-        out_dir / "green_ordinal_model_final.joblib",
-    )
+    write_json(model.config() | {"args": args_payload}, out_dir / "model_config.json")
+    joblib.dump(model, out_dir / "green_ordinal_model_final.joblib")
+    print(f"[INFO] Saved final model: {out_dir / 'green_ordinal_model_final.joblib'}")
 
