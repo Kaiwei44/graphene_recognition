@@ -62,6 +62,18 @@ def flake_area_um2(flake) -> float:
     return float(flake.measurements.area_um2)
 
 
+def flake_shape_complexity(flake) -> float:
+    mask = flake.mask.astype(np.uint8)
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    perimeter_px = sum(cv2.arcLength(contour, True) for contour in contours)
+    area_px = max(int(np.count_nonzero(mask)), 1)
+    return float((perimeter_px * perimeter_px) / (4.0 * np.pi * area_px))
+
+
 def color_for_index(index: int) -> tuple[int, int, int]:
     palette = [
         (0, 255, 255),
@@ -87,7 +99,10 @@ def format_flake_label(index: int, flake, label_mode: str) -> str:
         return f"#{index} s={flake_score(flake):.2f}"
     if label_mode == "area":
         return f"#{index} a={flake_area_um2(flake):.1f}"
-    return f"#{index} s={flake_score(flake):.2f} a={flake_area_um2(flake):.1f}"
+    return (
+        f"#{index} s={flake_score(flake):.2f} "
+        f"a={flake_area_um2(flake):.1f} c={flake_shape_complexity(flake):.1f}"
+    )
 
 
 def draw_text_box(image, text: str, origin: tuple[int, int], color: tuple[int, int, int]):
@@ -180,6 +195,7 @@ def write_flake_rows(writer, dataset_dict, flakes):
                 "center_y": int(flake.center[1]),
                 "max_sidelength_px": f"{float(flake.max_sidelength):.3f}",
                 "min_sidelength_px": f"{float(flake.min_sidelength):.3f}",
+                "shape_complexity": f"{flake_shape_complexity(flake):.6f}",
             }
         )
 
@@ -296,6 +312,7 @@ def main():
             "center_y",
             "max_sidelength_px",
             "min_sidelength_px",
+            "shape_complexity",
         ],
     )
     csv_writer.writeheader()
