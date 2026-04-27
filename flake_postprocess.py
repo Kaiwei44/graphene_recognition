@@ -41,6 +41,8 @@ class PostprocessParams:
     final_min_area_um2: float = 100.0
     # 所有合并完成后，再删除最终 score 小于该值的 flake。
     final_min_score: float = 0.015
+    # 所有合并完成后，再删除形状复杂度超过该值的 flake；值越大表示越细长/破碎。
+    final_max_shape_complexity: float = 5.0
     # bridge merge 的最大迭代轮数；每轮合并后会重新计算 mask 和 Lab median。
     max_bridge_passes: int = 5
 
@@ -116,6 +118,8 @@ class GrapheneFlakePostprocessor:
             for candidate in bridge_candidates
             if candidate.score >= self.params.final_min_score
             and candidate.flake.measurements.area_um2 >= self.params.final_min_area_um2
+            and self._shape_complexity(candidate.mask)
+            <= self.params.final_max_shape_complexity
         ]
 
         result = PostprocessResult(
@@ -438,6 +442,17 @@ class GrapheneFlakePostprocessor:
 
     def _flake_score(self, flake: Flake) -> float:
         return max(0.0, min(1.0, 1.0 - float(flake.false_positive_probability)))
+
+    def _shape_complexity(self, mask: np.ndarray) -> float:
+        mask = self._as_mask(mask)
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        perimeter_px = sum(cv2.arcLength(contour, True) for contour in contours)
+        area_px = max(cv2.countNonZero(mask), 1)
+        return float((perimeter_px * perimeter_px) / (4.0 * np.pi * area_px))
 
     def _sigmoid(self, values: np.ndarray) -> np.ndarray:
         values = np.clip(values, -50.0, 50.0)
