@@ -164,12 +164,39 @@ def macro_f1(y_true: list[int], y_pred: list[int], labels: list[int]) -> float:
     return float(np.mean(scores))
 
 
+def binary_metrics(y_true: list[int], y_pred: list[int], positive_label: int) -> dict[str, float]:
+    y_true_arr = np.asarray(y_true)
+    y_pred_arr = np.asarray(y_pred)
+    tp = np.sum((y_true_arr == positive_label) & (y_pred_arr == positive_label))
+    fp = np.sum((y_true_arr != positive_label) & (y_pred_arr == positive_label))
+    fn = np.sum((y_true_arr == positive_label) & (y_pred_arr != positive_label))
+    precision = float(tp / (tp + fp)) if (tp + fp) else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) else 0.0
+    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
 def write_confusion(path: Path, mat: np.ndarray, labels: list[int]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["true\\pred"] + [LABEL_NAMES.get(label, str(label)) for label in labels])
         for label, row in zip(labels, mat):
             writer.writerow([LABEL_NAMES.get(label, str(label))] + row.tolist())
+
+
+def print_confusion(title: str, mat: np.ndarray, labels: list[int]) -> None:
+    names = [LABEL_NAMES.get(label, str(label)) for label in labels]
+    widths = [max(len(name), 8) for name in names]
+    first_width = max(len(title), 12)
+    print(f"\n[{title}]")
+    print(" " * first_width + " " + " ".join(f"{name:>{width}}" for name, width in zip(names, widths)))
+    for name, width, row in zip(names, widths, mat):
+        values = " ".join(f"{int(value):>{w}}" for value, w in zip(row, widths))
+        print(f"{name:>{first_width}} {values}")
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -285,6 +312,8 @@ def evaluate(args: argparse.Namespace) -> None:
             LABEL_NAMES[label]: value
             for label, value in per_class_accuracy(flake_true, flake_pred_amm, foreground_labels).items()
         },
+        "low_vs_rest_logit": binary_metrics(flake_true, flake_pred_logit, positive_label=1),
+        "low_vs_rest_amm": binary_metrics(flake_true, flake_pred_amm, positive_label=1),
         "pixel_true_counts": {
             LABEL_NAMES[label]: int(pixel_true_counter[label]) for label in foreground_labels
         },
@@ -298,9 +327,32 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"  AMM accuracy:   {metrics['flake_amm_accuracy']:.4f}")
     print(f"  logit macro-F1: {metrics['flake_logit_macro_f1']:.4f}")
     print(f"  AMM macro-F1:   {metrics['flake_amm_macro_f1']:.4f}")
+
+    print("\n[Logit per-class accuracy]")
+    for name, value in metrics["flake_logit_per_class_accuracy"].items():
+        print(f"  {name}: {value:.4f}")
     print("\n[AMM per-class accuracy]")
     for name, value in metrics["flake_amm_per_class_accuracy"].items():
         print(f"  {name}: {value:.4f}")
+
+    print("\n[Low-vs-rest gate]")
+    logit_low = metrics["low_vs_rest_logit"]
+    amm_low = metrics["low_vs_rest_amm"]
+    print(
+        "  logit "
+        f"precision={logit_low['precision']:.4f} "
+        f"recall={logit_low['recall']:.4f} "
+        f"f1={logit_low['f1']:.4f}"
+    )
+    print(
+        "  AMM   "
+        f"precision={amm_low['precision']:.4f} "
+        f"recall={amm_low['recall']:.4f} "
+        f"f1={amm_low['f1']:.4f}"
+    )
+
+    print_confusion("Flake confusion, logit", logit_cm, labels)
+    print_confusion("Flake confusion, AMM", amm_cm, labels)
     print(f"\nSaved evaluation files to {out_dir}")
 
 
