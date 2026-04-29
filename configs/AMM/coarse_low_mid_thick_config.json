@@ -1,6 +1,6 @@
 {
   "train_params": {
-    "num_iterations": 5000,
+    "num_iterations": 10000,
     "learning_rate": 0.01,
     "loss_function": "CrossEntropyLoss",
     "test_interval": 100,
