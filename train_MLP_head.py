@@ -9,7 +9,7 @@ from maskterial.modeling.common.fcresnet import FCResNet
 from maskterial.utils.argparser import parse_cls_args
 from maskterial.utils.data_loader import ContrastDataloader
 
-DEVICE = "cpu"  # or "cuda" if you have a GPU, but the AMM is quite small so it should be fine on CPU
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 if __name__ == "__main__":
     args = parse_cls_args()
