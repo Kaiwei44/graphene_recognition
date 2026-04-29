@@ -1,0 +1,25 @@
+{
+  "num_images": 139,
+  "num_flakes": 170,
+  "skipped_images": 0,
+  "skipped_annotations": 9,
+  "flake_logit_accuracy": 0.6941176470588235,
+  "flake_amm_accuracy": 0.4,
+  "flake_logit_macro_f1": 0.7106290217778616,
+  "flake_amm_macro_f1": 0.42702200779223265,
+  "flake_logit_per_class_accuracy": {
+    "low_1_5": 0.7222222222222222,
+    "mid_6_8": 0.5,
+    "thick_9_plus": 0.9047619047619048
+  },
+  "flake_amm_per_class_accuracy": {
+    "low_1_5": 0.013888888888888888,
+    "mid_6_8": 0.5357142857142857,
+    "thick_9_plus": 0.8809523809523809
+  },
+  "pixel_true_counts": {
+    "low_1_5": 199349,
+    "mid_6_8": 420071,
+    "thick_9_plus": 219557
+  }
+}
