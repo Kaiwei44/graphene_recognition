@@ -61,6 +61,14 @@ COMPACT_PHI_FEATURES = [
     "z_ndg_wb2",
 ]
 
+FLAKE_REP_MODES = (
+    "peak",
+    "median",
+    "trimmed_median",
+    "central_median",
+    "largest_inner_median",
+)
+
 
 @dataclass(slots=True)
 class ExtractConfig:
@@ -82,6 +90,10 @@ class ExtractConfig:
     bg_residual_clip_sigma: float = 2.5
     bg_residual_clip_iters: int = 2
     bg_residual_sigma_floor: float = 1.0
+    flake_rep_mode: str = "peak"
+    flake_peak_bins: int = 50
+    flake_inner_erode_px: int = 2
+    flake_min_inner_pixels: int = 20
 
 
 @dataclass(slots=True)
@@ -93,6 +105,8 @@ class GreenFeatureRow:
     ann_id: int
     layer: int
     group: str
+    flake_rep_mode: str
+    flake_rep_source: str
     wb1: float
     wb2: float
     wb_product: float
@@ -107,9 +121,22 @@ class GreenFeatureRow:
     roi_bg_clip_iterations: int
     roi_bg_residual_sigma: float
     ndg: float
+    ndg_peak: float
+    ndg_mask_median: float
+    ndg_trimmed_median: float
+    ndg_central_median: float
+    ndg_largest_inner_median: float
     delta_g: float
     abs_delta_g: float
+    g_flake_rep: float
+    g_flake_peak: float
+    g_flake_mask_median: float
+    g_flake_trimmed_median: float
+    g_flake_central_median: float
+    g_flake_largest_inner_median: float
     g_flake_median: float
+    flake_inner_area_px: int
+    flake_largest_inner_area_px: int
     g_bg_plane_median: float
     g_delta_p10: float
     g_delta_p90: float
@@ -669,6 +696,15 @@ def dilate_boolean_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
 
 
+def erode_boolean_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
+    radius = max(0, int(radius_px))
+    if radius == 0 or not np.any(mask):
+        return mask.astype(bool)
+    kernel_size = 2 * radius + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    return cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+
+
 def estimate_background_peak(values: np.ndarray, num_bins: int) -> float:
     values = np.asarray(values, dtype=np.float32)
     values = values[np.isfinite(values)]
@@ -687,6 +723,103 @@ def estimate_flake_peak(values: np.ndarray, num_bins: int = 50) -> float:
     hist, bin_edges = np.histogram(values, bins=num_bins)
     peak_index = int(np.argmax(hist))
     return float((bin_edges[peak_index] + bin_edges[peak_index + 1]) / 2.0)
+
+
+def safe_median(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float32)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    return float(np.median(values))
+
+
+def trimmed_median(values: np.ndarray, low: float, high: float) -> float:
+    values = np.asarray(values, dtype=np.float32)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    lo, hi = np.percentile(values, [low, high])
+    trimmed = values[(values >= lo) & (values <= hi)]
+    if trimmed.size == 0:
+        return float(np.median(values))
+    return float(np.median(trimmed))
+
+
+def largest_connected_component(mask: np.ndarray, min_pixels: int) -> np.ndarray:
+    mask_u8 = mask.astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if count <= 1:
+        return np.zeros_like(mask, dtype=bool)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_index = int(np.argmax(areas)) + 1
+    if int(stats[largest_index, cv2.CC_STAT_AREA]) < min_pixels:
+        return np.zeros_like(mask, dtype=bool)
+    return labels == largest_index
+
+
+def compute_flake_representatives(delta: np.ndarray, flake_mask: np.ndarray, cfg: ExtractConfig) -> dict[str, float | int]:
+    flake_values = delta[flake_mask].astype(np.float32)
+    inner_mask = erode_boolean_mask(flake_mask.astype(bool), cfg.flake_inner_erode_px)
+    inner_area = int(np.count_nonzero(inner_mask))
+    largest_inner_mask = largest_connected_component(inner_mask, cfg.flake_min_inner_pixels)
+    largest_inner_area = int(np.count_nonzero(largest_inner_mask))
+
+    central_median = float("nan")
+    if inner_area >= cfg.flake_min_inner_pixels:
+        central_median = safe_median(delta[inner_mask])
+
+    largest_inner_median = float("nan")
+    if largest_inner_area >= cfg.flake_min_inner_pixels:
+        largest_inner_median = safe_median(delta[largest_inner_mask])
+
+    return {
+        "peak": estimate_flake_peak(flake_values, num_bins=cfg.flake_peak_bins),
+        "median": safe_median(flake_values),
+        "trimmed_median": trimmed_median(flake_values, cfg.trim_low, cfg.trim_high),
+        "central_median": central_median,
+        "largest_inner_median": largest_inner_median,
+        "inner_area_px": inner_area,
+        "largest_inner_area_px": largest_inner_area,
+    }
+
+
+def normalize_flake_rep_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "mode": "peak",
+        "hist_peak": "peak",
+        "histogram_peak": "peak",
+        "mask_median": "median",
+        "plain_median": "median",
+        "trimmed": "trimmed_median",
+        "central": "central_median",
+        "inner_median": "central_median",
+        "largest_inner": "largest_inner_median",
+        "largest_connected_inner_median": "largest_inner_median",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in FLAKE_REP_MODES:
+        raise ValueError(f"Unknown flake_rep_mode={mode!r}; valid={list(FLAKE_REP_MODES)}")
+    return normalized
+
+
+def select_flake_representative(representatives: dict[str, float | int], mode: str) -> tuple[float, str]:
+    normalized = normalize_flake_rep_mode(mode)
+    value = float(representatives.get(normalized, float("nan")))
+    if np.isfinite(value):
+        return value, normalized
+
+    for fallback in ("median", "trimmed_median", "peak"):
+        value = float(representatives.get(fallback, float("nan")))
+        if np.isfinite(value):
+            return value, f"{normalized}_fallback_{fallback}"
+    return float("nan"), f"{normalized}_fallback_nan"
+
+
+def ndg_from_rep(rep_value: float, bg_corr_median: float, bg_plane_median: float) -> float:
+    if not np.isfinite(rep_value):
+        return float("nan")
+    return float((rep_value - bg_corr_median) / max(abs(bg_plane_median), 1.0))
 
 
 def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.ndarray, union_mask: np.ndarray, cfg: ExtractConfig) -> dict | None:
@@ -780,14 +913,20 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
     g_corr = g_hybrid - g_bg_fit
 
     flake_corr_values = g_corr[annotation_crop]
-    g_flake_median = estimate_flake_peak(flake_corr_values, num_bins=50)
+    flake_reps = compute_flake_representatives(g_corr, annotation_crop, cfg)
+    g_flake_rep, flake_rep_source = select_flake_representative(flake_reps, cfg.flake_rep_mode)
     g_bg_corr_median = float(np.median(g_corr[background_mask])) if int(np.count_nonzero(background_mask)) else 0.0
     g_bg_plane_median = float(np.median(g_bg_fit[annotation_crop]))
-    delta_g = float(g_flake_median - g_bg_corr_median)
+    delta_g = float(g_flake_rep - g_bg_corr_median)
     ndg = delta_g / max(abs(g_bg_plane_median), 1.0)
     p10, p90 = np.percentile(flake_corr_values, [10, 90])
     g_delta_iqr = float(p90 - p10)
     iqr_ndg = g_delta_iqr / max(abs(g_bg_plane_median), 1.0)
+    ndg_peak = ndg_from_rep(float(flake_reps["peak"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_mask_median = ndg_from_rep(float(flake_reps["median"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_trimmed_median = ndg_from_rep(float(flake_reps["trimmed_median"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_central_median = ndg_from_rep(float(flake_reps["central_median"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_largest_inner_median = ndg_from_rep(float(flake_reps["largest_inner_median"]), g_bg_corr_median, g_bg_plane_median)
 
     return {
         "area_px": area_px,
@@ -799,10 +938,24 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
         "roi_bg_initial_pixels": int(initial_bg_pixels),
         "roi_bg_clip_iterations": int(clip_iterations),
         "roi_bg_residual_sigma": float(residual_sigma),
+        "flake_rep_source": str(flake_rep_source),
         "ndg": float(ndg),
+        "ndg_peak": float(ndg_peak),
+        "ndg_mask_median": float(ndg_mask_median),
+        "ndg_trimmed_median": float(ndg_trimmed_median),
+        "ndg_central_median": float(ndg_central_median),
+        "ndg_largest_inner_median": float(ndg_largest_inner_median),
         "delta_g": float(delta_g),
         "abs_delta_g": float(abs(delta_g)),
-        "g_flake_median": g_flake_median,
+        "g_flake_rep": float(g_flake_rep),
+        "g_flake_peak": float(flake_reps["peak"]),
+        "g_flake_mask_median": float(flake_reps["median"]),
+        "g_flake_trimmed_median": float(flake_reps["trimmed_median"]),
+        "g_flake_central_median": float(flake_reps["central_median"]),
+        "g_flake_largest_inner_median": float(flake_reps["largest_inner_median"]),
+        "g_flake_median": float(g_flake_rep),
+        "flake_inner_area_px": int(flake_reps["inner_area_px"]),
+        "flake_largest_inner_area_px": int(flake_reps["largest_inner_area_px"]),
         "g_bg_plane_median": float(g_bg_plane_median),
         "g_delta_p10": float(p10),
         "g_delta_p90": float(p90),
@@ -874,6 +1027,7 @@ def read_split_features(split: str, image_dir: str | os.PathLike, coco_path: str
                     ann_id=int(annotation.get("id", -1)),
                     layer=int(layer),
                     group=group,
+                    flake_rep_mode=normalize_flake_rep_mode(cfg.flake_rep_mode),
                     wb1=float(wb1),
                     wb2=float(wb2),
                     wb_product=float(wb1 * wb2) if np.isfinite(wb1) and np.isfinite(wb2) else float("nan"),
@@ -957,7 +1111,14 @@ def read_csv(path: str | os.PathLike) -> list[dict]:
 
 
 def coerce_rows(rows: list[dict]) -> list[dict]:
-    numeric_columns = set(GreenFeatureRow.__dataclass_fields__) - {"split", "filename", "image_path", "group"}
+    numeric_columns = set(GreenFeatureRow.__dataclass_fields__) - {
+        "split",
+        "filename",
+        "image_path",
+        "group",
+        "flake_rep_mode",
+        "flake_rep_source",
+    }
     output = []
     for row in rows:
         converted = dict(row)

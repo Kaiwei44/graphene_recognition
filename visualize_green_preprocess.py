@@ -13,15 +13,19 @@ import numpy as np
 
 from layer_recognition.green_ordinal import (
     ExtractConfig,
+    FLAKE_REP_MODES,
     ann_to_mask,
     build_category_to_layer,
+    compute_flake_representatives,
     dilate_boolean_mask,
     estimate_background_peak,
-    estimate_flake_peak,
     expand_path,
     fit_background_plane_clipped,
     load_coco,
+    ndg_from_rep,
+    normalize_flake_rep_mode,
     parse_wb_from_filename,
+    select_flake_representative,
     trimmed_mean,
 )
 
@@ -191,14 +195,20 @@ def make_visualization(
 
     plane_at_flake = plane[flake_roi]
     delta_values = delta[flake_roi].astype(np.float32)
-    g_flake_median = estimate_flake_peak(delta[flake_roi], num_bins=50)
+    flake_reps = compute_flake_representatives(delta, flake_roi, cfg)
+    g_flake_rep, flake_rep_source = select_flake_representative(flake_reps, cfg.flake_rep_mode)
     g_bg_corr_median = float(np.median(delta[background_mask])) if int(np.count_nonzero(background_mask)) else 0.0
     g_bg_plane_median = float(np.median(plane_at_flake))
-    delta_g = float(g_flake_median - g_bg_corr_median)
+    delta_g = float(g_flake_rep - g_bg_corr_median)
     ndg = delta_g / max(abs(g_bg_plane_median), 1.0)
     p10, p90 = np.percentile(delta_values, [10, 90])
     g_delta_iqr = float(p90 - p10)
     iqr_ndg = g_delta_iqr / max(abs(g_bg_plane_median), 1.0)
+    ndg_peak = ndg_from_rep(float(flake_reps["peak"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_mask_median = ndg_from_rep(float(flake_reps["median"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_trimmed_median = ndg_from_rep(float(flake_reps["trimmed_median"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_central_median = ndg_from_rep(float(flake_reps["central_median"]), g_bg_corr_median, g_bg_plane_median)
+    ndg_largest_inner_median = ndg_from_rep(float(flake_reps["largest_inner_median"]), g_bg_corr_median, g_bg_plane_median)
 
     raw_green = cv2.cvtColor(normalize_gray(green_crop), cv2.COLOR_GRAY2BGR)
     draw_contours(raw_green, flake_roi, (0, 0, 255), thickness=1)
@@ -214,10 +224,10 @@ def make_visualization(
 
     panel_size = 360
     panels = [
-        label_panel(resize_panel(raw_green, panel_size), "raw green channel"),
+        label_panel(resize_panel(raw_green, panel_size), f"raw green channel | mask={area_px}px bbox={bbox_w}x{bbox_h}"),
         label_panel(resize_panel(bilateral_green, panel_size), "green after bilateral filter"),
         label_panel(resize_panel(plane_vis, panel_size), f"regressed background plane ({fit_source})"),
-        label_panel(resize_panel(delta_vis, panel_size), f"flake mask: corrected green - background"),
+        label_panel(resize_panel(delta_vis, panel_size), f"delta | {flake_rep_source} ndg={ndg:.4f} iqr={iqr_ndg:.4f}"),
     ]
     stats = {
         "area_px": area_px,
@@ -227,9 +237,24 @@ def make_visualization(
         "roi_bg_initial_pixels": int(initial_bg_pixels),
         "roi_bg_clip_iterations": int(clip_iterations),
         "roi_bg_residual_sigma": float(residual_sigma),
+        "flake_rep_mode": cfg.flake_rep_mode,
+        "flake_rep_source": str(flake_rep_source),
         "ndg": float(ndg),
+        "ndg_peak": float(ndg_peak),
+        "ndg_mask_median": float(ndg_mask_median),
+        "ndg_trimmed_median": float(ndg_trimmed_median),
+        "ndg_central_median": float(ndg_central_median),
+        "ndg_largest_inner_median": float(ndg_largest_inner_median),
         "delta_g": float(delta_g),
-        "g_flake_median": g_flake_median,
+        "g_flake_rep": float(g_flake_rep),
+        "g_flake_peak": float(flake_reps["peak"]),
+        "g_flake_mask_median": float(flake_reps["median"]),
+        "g_flake_trimmed_median": float(flake_reps["trimmed_median"]),
+        "g_flake_central_median": float(flake_reps["central_median"]),
+        "g_flake_largest_inner_median": float(flake_reps["largest_inner_median"]),
+        "g_flake_median": float(g_flake_rep),
+        "flake_inner_area_px": int(flake_reps["inner_area_px"]),
+        "flake_largest_inner_area_px": int(flake_reps["largest_inner_area_px"]),
         "g_bg_plane_median": g_bg_plane_median,
         "g_delta_p10": float(p10),
         "g_delta_p90": float(p90),
@@ -255,6 +280,10 @@ def visualize(args: argparse.Namespace) -> None:
         bg_residual_clip_sigma=args.bg_residual_clip_sigma,
         bg_residual_clip_iters=args.bg_residual_clip_iters,
         bg_residual_sigma_floor=args.bg_residual_sigma_floor,
+        flake_rep_mode=args.flake_rep_mode,
+        flake_peak_bins=args.flake_peak_bins,
+        flake_inner_erode_px=args.flake_inner_erode_px,
+        flake_min_inner_pixels=args.flake_min_inner_pixels,
         trim_low=args.trim_low,
         trim_high=args.trim_high,
     )
@@ -368,6 +397,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bg-residual-clip-sigma", type=float, default=2.5)
     parser.add_argument("--bg-residual-clip-iters", type=int, default=2)
     parser.add_argument("--bg-residual-sigma-floor", type=float, default=1.0)
+    parser.add_argument(
+        "--flake-rep-mode",
+        default="peak",
+        help=f"Flake representative for ndg. Valid: {', '.join(FLAKE_REP_MODES)}. Alias: mode=peak.",
+    )
+    parser.add_argument("--flake-peak-bins", type=int, default=50)
+    parser.add_argument("--flake-inner-erode-px", type=int, default=2)
+    parser.add_argument("--flake-min-inner-pixels", type=int, default=20)
     parser.add_argument("--trim-low", type=float, default=10.0)
     parser.add_argument("--trim-high", type=float, default=90.0)
     parser.add_argument(
@@ -376,7 +413,9 @@ def parse_args() -> argparse.Namespace:
         default="training",
         help="training matches green_ordinal.py: background bilateral for plane, flake bilateral inside masks.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.flake_rep_mode = normalize_flake_rep_mode(args.flake_rep_mode)
+    return args
 
 
 if __name__ == "__main__":

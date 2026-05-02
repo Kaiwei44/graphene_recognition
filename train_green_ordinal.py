@@ -6,11 +6,13 @@ from layer_recognition.green_ordinal import (
     COMPACT_BASE_FEATURES,
     COMPACT_PHI_FEATURES,
     ExtractConfig,
+    FLAKE_REP_MODES,
     VALID_LAYERS,
     class_counts,
     coerce_rows,
     expand_path,
     extract_features,
+    normalize_flake_rep_mode,
     parse_alpha_grid,
     read_csv,
     rows_to_dicts,
@@ -58,6 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bg-residual-clip-sigma", type=float, default=2.5)
     parser.add_argument("--bg-residual-clip-iters", type=int, default=2)
     parser.add_argument("--bg-residual-sigma-floor", type=float, default=1.0)
+    parser.add_argument(
+        "--flake-rep-mode",
+        default="peak",
+        help=f"Flake representative for ndg. Valid: {', '.join(FLAKE_REP_MODES)}. Alias: mode=peak.",
+    )
+    parser.add_argument("--flake-peak-bins", type=int, default=50)
+    parser.add_argument("--flake-inner-erode-px", type=int, default=2)
+    parser.add_argument("--flake-min-inner-pixels", type=int, default=20)
     parser.add_argument("--trim-low", type=float, default=10.0)
     parser.add_argument("--trim-high", type=float, default=90.0)
 
@@ -72,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.ridge_alpha is not None:
         args.alpha = float(args.ridge_alpha)
+    args.flake_rep_mode = normalize_flake_rep_mode(args.flake_rep_mode)
     return args
 
 
@@ -101,6 +112,10 @@ def main() -> None:
             bg_residual_clip_sigma=args.bg_residual_clip_sigma,
             bg_residual_clip_iters=args.bg_residual_clip_iters,
             bg_residual_sigma_floor=args.bg_residual_sigma_floor,
+            flake_rep_mode=args.flake_rep_mode,
+            flake_peak_bins=args.flake_peak_bins,
+            flake_inner_erode_px=args.flake_inner_erode_px,
+            flake_min_inner_pixels=args.flake_min_inner_pixels,
             trim_low=args.trim_low,
             trim_high=args.trim_high,
         )
