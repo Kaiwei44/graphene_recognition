@@ -15,10 +15,12 @@ from layer_recognition.green_ordinal import (
     ExtractConfig,
     ann_to_mask,
     build_category_to_layer,
+    estimate_background_peak,
+    estimate_flake_peak,
     expand_path,
+    fit_background_plane,
     load_coco,
     parse_wb_from_filename,
-    robust_plane_fit,
     trimmed_mean,
 )
 
@@ -55,43 +57,16 @@ def normalize_gray(values: np.ndarray, p_low: float = 1.0, p_high: float = 99.0)
     return (out * 255).astype(np.uint8)
 
 
-def colorize_delta(delta: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
-    values = delta.astype(np.float32)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        scaled = np.zeros(values.shape, dtype=np.uint8)
-    else:
-        limit = float(np.percentile(np.abs(finite), 98))
-        limit = max(limit, 1.0)
-        scaled = np.clip((values + limit) / (2 * limit), 0, 1)
-        scaled = (scaled * 255).astype(np.uint8)
-    heat = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
-    if mask is not None:
-        draw_contours(heat, mask, (255, 255, 255), thickness=1)
-    return heat
-
-
 def draw_contours(image: np.ndarray, mask: np.ndarray, color: tuple[int, int, int], thickness: int = 2) -> None:
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         cv2.drawContours(image, contours, -1, color, thickness)
 
 
-def text_panel(lines: list[str], width: int, height: int) -> np.ndarray:
-    panel = np.full((height, width, 3), 255, dtype=np.uint8)
-    y = 28
-    for line in lines:
-        cv2.putText(panel, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (20, 20, 20), 1, cv2.LINE_AA)
-        y += 24
-        if y > height - 12:
-            break
-    return panel
-
-
 def label_panel(image: np.ndarray, label: str) -> np.ndarray:
     output = image.copy()
     cv2.rectangle(output, (0, 0), (output.shape[1], 26), (255, 255, 255), thickness=-1)
-    cv2.putText(output, label, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(output, label, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
     return output
 
 
@@ -134,71 +109,94 @@ def make_visualization(
     y0 = int(max(0, math.floor(center_y - roi_h / 2.0)))
     y1 = int(min(height, math.ceil(center_y + roi_h / 2.0)))
 
-    roi_mask = np.zeros((height, width), dtype=bool)
-    roi_mask[y0:y1, x0:x1] = True
-
-    kernel_size = max(1, int(cfg.edge_dilate_px))
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-    dilated_union = cv2.dilate(union_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-    background_mask = roi_mask & (~dilated_union)
-    if int(np.count_nonzero(background_mask)) < cfg.bg_min_pixels:
-        background_mask = roi_mask & (~union_mask)
-    if int(np.count_nonzero(background_mask)) < cfg.bg_min_pixels:
+    roi_slice = np.s_[y0:y1, x0:x1]
+    flake_roi = annotation_mask[roi_slice]
+    union_roi = union_mask[roi_slice]
+    if int(np.count_nonzero(flake_roi)) < cfg.min_area_px:
         return None
 
     green = image_bgr[:, :, 1].astype(np.float32)
+    green_crop = green[roi_slice]
+    g_smooth_bg = cv2.bilateralFilter(
+        green_crop,
+        d=-1,
+        sigmaColor=cfg.bg_bilateral_sigma_color,
+        sigmaSpace=cfg.bg_bilateral_sigma_space,
+    )
+    g_smooth_flake = cv2.bilateralFilter(
+        green_crop,
+        d=-1,
+        sigmaColor=cfg.flake_bilateral_sigma_color,
+        sigmaSpace=cfg.flake_bilateral_sigma_space,
+    )
+
+    if cfg.fit_source == "raw":
+        fit_map = green_crop
+        flake_map = green_crop
+        candidate_source = green_crop
+    else:
+        fit_map = g_smooth_bg
+        flake_map = g_smooth_flake if cfg.fit_source == "training" else g_smooth_bg
+        candidate_source = g_smooth_bg
+
+    candidate_mask = candidate_source <= cfg.bg_threshold_high
+    candidate_mask = candidate_mask & (~union_roi.astype(bool))
+    if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
+        candidate_mask = ~union_roi.astype(bool)
+    if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
+        return None
+
+    bg_peak = estimate_background_peak(candidate_source[candidate_mask], cfg.bg_peak_bins)
+    background_mask = (
+        candidate_mask
+        & (candidate_source >= bg_peak - cfg.bg_tol_low)
+        & (candidate_source <= bg_peak + cfg.bg_tol_high)
+    )
+    if int(np.count_nonzero(background_mask)) < cfg.bg_min_pixels:
+        background_mask = candidate_mask
+    if int(np.count_nonzero(background_mask)) < cfg.bg_min_pixels:
+        return None
+
     bg_y, bg_x = np.where(background_mask)
-    bg_values = green[background_mask]
-    a, b, c = robust_plane_fit(bg_x, bg_y, bg_values, sample_max=cfg.bg_sample_max)
+    bg_values = fit_map[background_mask]
+    a, b, c = fit_background_plane(bg_x, bg_y, bg_values, sample_max=cfg.bg_sample_max)
 
-    grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    crop_height, crop_width = green_crop.shape
+    grid_x, grid_y = np.meshgrid(np.arange(crop_width, dtype=np.float32), np.arange(crop_height, dtype=np.float32))
     plane = a * grid_x + b * grid_y + c
-    delta = green - plane
+    hybrid = fit_map.copy()
+    hybrid[union_roi.astype(bool)] = flake_map[union_roi.astype(bool)]
+    delta = hybrid - plane
 
-    plane_at_flake = plane[annotation_mask]
-    flake_values = green[annotation_mask].astype(np.float32)
-    delta_values = flake_values - plane_at_flake.astype(np.float32)
-    g_flake_median = float(np.median(flake_values))
+    plane_at_flake = plane[flake_roi]
+    delta_values = delta[flake_roi].astype(np.float32)
+    g_flake_median = estimate_flake_peak(delta[flake_roi], num_bins=50)
+    g_bg_corr_median = float(np.median(delta[background_mask])) if int(np.count_nonzero(background_mask)) else 0.0
     g_bg_plane_median = float(np.median(plane_at_flake))
-    delta_g = trimmed_mean(delta_values, cfg.trim_low, cfg.trim_high)
+    delta_g = float(g_flake_median - g_bg_corr_median)
     ndg = delta_g / max(abs(g_bg_plane_median), 1.0)
     p10, p90 = np.percentile(delta_values, [10, 90])
     g_delta_iqr = float(p90 - p10)
     iqr_ndg = g_delta_iqr / max(abs(g_bg_plane_median), 1.0)
 
-    roi_slice = np.s_[y0:y1, x0:x1]
-    image_roi = image_bgr[roi_slice].copy()
-    green_roi = green[roi_slice]
-    plane_roi = plane[roi_slice]
-    delta_roi = delta[roi_slice]
-    flake_roi = annotation_mask[roi_slice]
-    bg_roi = background_mask[roi_slice]
-    union_roi = union_mask[roi_slice]
-
-    original_overlay = image_roi.copy()
-    bg_overlay = original_overlay.copy()
-    bg_overlay[bg_roi] = (0.65 * bg_overlay[bg_roi] + 0.35 * np.array([255, 180, 0])).astype(np.uint8)
-    original_overlay = bg_overlay
-    draw_contours(original_overlay, union_roi, (130, 130, 130), thickness=1)
-    draw_contours(original_overlay, flake_roi, (0, 0, 255), thickness=2)
-
-    raw_green = cv2.cvtColor(normalize_gray(green_roi), cv2.COLOR_GRAY2BGR)
+    raw_green = cv2.cvtColor(normalize_gray(green_crop), cv2.COLOR_GRAY2BGR)
     draw_contours(raw_green, flake_roi, (0, 0, 255), thickness=1)
-    plane_vis = cv2.cvtColor(normalize_gray(plane_roi), cv2.COLOR_GRAY2BGR)
-    delta_vis = colorize_delta(delta_roi, flake_roi)
+    bilateral_green = cv2.cvtColor(normalize_gray(g_smooth_bg), cv2.COLOR_GRAY2BGR)
+    draw_contours(bilateral_green, flake_roi, (0, 0, 255), thickness=1)
+    plane_vis = cv2.cvtColor(normalize_gray(plane), cv2.COLOR_GRAY2BGR)
+    draw_contours(plane_vis, flake_roi, (0, 0, 255), thickness=1)
 
-    mask_vis = np.full_like(image_roi, 245)
-    mask_vis[bg_roi] = (0, 180, 0)
-    mask_vis[union_roi] = (160, 160, 160)
-    mask_vis[flake_roi] = (0, 0, 255)
+    flake_delta_only = np.zeros_like(delta, dtype=np.float32)
+    flake_delta_only[flake_roi] = delta[flake_roi]
+    delta_vis = cv2.cvtColor(normalize_gray(flake_delta_only, p_low=0.0, p_high=100.0), cv2.COLOR_GRAY2BGR)
+    draw_contours(delta_vis, flake_roi, (0, 0, 255), thickness=1)
 
     panel_size = 360
     panels = [
-        label_panel(resize_panel(original_overlay, panel_size), "ROI: original + flake contour + bg pixels"),
         label_panel(resize_panel(raw_green, panel_size), "raw green channel"),
-        label_panel(resize_panel(plane_vis, panel_size), "fitted green background plane"),
-        label_panel(resize_panel(delta_vis, panel_size), "green - fitted plane"),
-        label_panel(resize_panel(mask_vis, panel_size), "masks: red=flake, green=background"),
+        label_panel(resize_panel(bilateral_green, panel_size), "green after bilateral filter"),
+        label_panel(resize_panel(plane_vis, panel_size), f"regressed background plane ({cfg.fit_source})"),
+        label_panel(resize_panel(delta_vis, panel_size), f"flake mask: corrected green - background"),
     ]
     stats = {
         "area_px": area_px,
@@ -217,22 +215,8 @@ def make_visualization(
         "plane_b": float(b),
         "plane_c": float(c),
     }
-    lines = [
-        f"area_px: {area_px}",
-        f"bbox: {bbox_w} x {bbox_h}",
-        f"roi_bg_pixels: {stats['roi_bg_pixels']}",
-        f"ndg: {ndg:.6f}",
-        f"delta_g: {delta_g:.3f}",
-        f"g_flake_median: {g_flake_median:.3f}",
-        f"g_bg_plane_median: {g_bg_plane_median:.3f}",
-        f"g_delta_iqr: {g_delta_iqr:.3f}",
-        f"iqr_ndg: {iqr_ndg:.6f}",
-        f"plane: {a:.4g} x + {b:.4g} y + {c:.3f}",
-    ]
-    panels.append(label_panel(text_panel(lines, panel_size, panel_size), "extracted feature values"))
-
-    top = np.hstack(panels[:3])
-    bottom = np.hstack(panels[3:])
+    top = np.hstack(panels[:2])
+    bottom = np.hstack(panels[2:])
     canvas = np.vstack([top, bottom])
     return canvas, stats
 
@@ -247,6 +231,7 @@ def visualize(args: argparse.Namespace) -> None:
         trim_low=args.trim_low,
         trim_high=args.trim_high,
     )
+    cfg.fit_source = args.fit_source
     image_dir = expand_path(args.image_dir)
     out_dir = expand_path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -356,6 +341,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bg-sample-max", type=int, default=20000)
     parser.add_argument("--trim-low", type=float, default=10.0)
     parser.add_argument("--trim-high", type=float, default=90.0)
+    parser.add_argument(
+        "--fit-source",
+        choices=["training", "raw", "bilateral"],
+        default="training",
+        help="training matches green_ordinal.py: background bilateral for plane, flake bilateral inside masks.",
+    )
     return parser.parse_args()
 
 

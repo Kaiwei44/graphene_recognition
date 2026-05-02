@@ -71,6 +71,14 @@ class ExtractConfig:
     edge_dilate_px: int = 5
     trim_low: float = 10.0
     trim_high: float = 90.0
+    bg_bilateral_sigma_color: float = 10.0
+    bg_bilateral_sigma_space: float = 3.0
+    flake_bilateral_sigma_color: float = 3.0
+    flake_bilateral_sigma_space: float = 8.0
+    bg_threshold_high: float = 180.0
+    bg_peak_bins: int = 256
+    bg_tol_low: float = 3.0
+    bg_tol_high: float = 3.0
 
 
 @dataclass(slots=True)
@@ -537,7 +545,7 @@ def trimmed_mean(values: np.ndarray, low: float = 10.0, high: float = 90.0) -> f
     return float(np.mean(trimmed))
 
 
-def robust_plane_fit(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, sample_max: int) -> tuple[float, float, float]:
+def fit_background_plane(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, sample_max: int) -> tuple[float, float, float]:
     xs = xs.astype(np.float32)
     ys = ys.astype(np.float32)
     values = values.astype(np.float32)
@@ -558,6 +566,26 @@ def robust_plane_fit(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, sample_
     design = np.column_stack([xs, ys, np.ones_like(xs)])
     coefs, *_ = np.linalg.lstsq(design, values, rcond=None)
     return float(coefs[0]), float(coefs[1]), float(coefs[2])
+
+
+def estimate_background_peak(values: np.ndarray, num_bins: int) -> float:
+    values = np.asarray(values, dtype=np.float32)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0
+    hist, bin_edges = np.histogram(values, bins=num_bins, range=(0, 255))
+    peak_index = int(np.argmax(hist))
+    return float((bin_edges[peak_index] + bin_edges[peak_index + 1]) / 2.0)
+
+
+def estimate_flake_peak(values: np.ndarray, num_bins: int = 50) -> float:
+    values = np.asarray(values, dtype=np.float32)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    hist, bin_edges = np.histogram(values, bins=num_bins)
+    peak_index = int(np.argmax(hist))
+    return float((bin_edges[peak_index] + bin_edges[peak_index + 1]) / 2.0)
 
 
 def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.ndarray, union_mask: np.ndarray, cfg: ExtractConfig) -> dict | None:
@@ -581,32 +609,63 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
     y0 = int(max(0, math.floor(center_y - roi_h / 2.0)))
     y1 = int(min(height, math.ceil(center_y + roi_h / 2.0)))
 
-    roi_mask = np.zeros((height, width), dtype=bool)
-    roi_mask[y0:y1, x0:x1] = True
+    roi_slice = np.s_[y0:y1, x0:x1]
+    annotation_crop = annotation_mask[roi_slice]
+    union_crop = union_mask[roi_slice]
+    if int(np.count_nonzero(annotation_crop)) < cfg.min_area_px:
+        return None
 
-    kernel_size = max(1, int(cfg.edge_dilate_px))
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-    dilated_union = cv2.dilate(union_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-    background_mask = roi_mask & (~dilated_union)
+    green_crop = image_bgr[roi_slice][:, :, 1].astype(np.float32)
+    g_smooth_bg = cv2.bilateralFilter(
+        green_crop,
+        d=-1,
+        sigmaColor=cfg.bg_bilateral_sigma_color,
+        sigmaSpace=cfg.bg_bilateral_sigma_space,
+    )
+    g_smooth_flake = cv2.bilateralFilter(
+        green_crop,
+        d=-1,
+        sigmaColor=cfg.flake_bilateral_sigma_color,
+        sigmaSpace=cfg.flake_bilateral_sigma_space,
+    )
+
+    candidate_mask = g_smooth_bg <= cfg.bg_threshold_high
+    candidate_mask = candidate_mask & (~union_crop.astype(bool))
+    if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
+        candidate_mask = ~union_crop.astype(bool)
+    if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
+        return None
+
+    bg_peak = estimate_background_peak(g_smooth_bg[candidate_mask], cfg.bg_peak_bins)
+    background_mask = (
+        candidate_mask
+        & (g_smooth_bg >= bg_peak - cfg.bg_tol_low)
+        & (g_smooth_bg <= bg_peak + cfg.bg_tol_high)
+    )
     if int(np.count_nonzero(background_mask)) < cfg.bg_min_pixels:
-        background_mask = roi_mask & (~union_mask)
+        background_mask = candidate_mask
     if int(np.count_nonzero(background_mask)) < cfg.bg_min_pixels:
         return None
 
-    green = image_bgr[:, :, 1].astype(np.float32)
     bg_y, bg_x = np.where(background_mask)
-    bg_values = green[background_mask]
-    a, b, c = robust_plane_fit(bg_x, bg_y, bg_values, sample_max=cfg.bg_sample_max)
+    bg_values = g_smooth_bg[background_mask]
+    a, b, c = fit_background_plane(bg_x, bg_y, bg_values, sample_max=cfg.bg_sample_max)
 
-    plane_at_flake = a * xs.astype(np.float32) + b * ys.astype(np.float32) + c
-    flake_values = green[annotation_mask].astype(np.float32)
-    delta_values = flake_values - plane_at_flake.astype(np.float32)
+    crop_height, crop_width = green_crop.shape
+    grid_x, grid_y = np.meshgrid(np.arange(crop_width, dtype=np.float32), np.arange(crop_height, dtype=np.float32))
+    g_bg_fit = a * grid_x + b * grid_y + c
 
-    g_flake_median = float(np.median(flake_values))
-    g_bg_plane_median = float(np.median(plane_at_flake))
-    delta_g = trimmed_mean(delta_values, cfg.trim_low, cfg.trim_high)
+    g_hybrid = g_smooth_bg.copy()
+    g_hybrid[union_crop.astype(bool)] = g_smooth_flake[union_crop.astype(bool)]
+    g_corr = g_hybrid - g_bg_fit
+
+    flake_corr_values = g_corr[annotation_crop]
+    g_flake_median = estimate_flake_peak(flake_corr_values, num_bins=50)
+    g_bg_corr_median = float(np.median(g_corr[background_mask])) if int(np.count_nonzero(background_mask)) else 0.0
+    g_bg_plane_median = float(np.median(g_bg_fit[annotation_crop]))
+    delta_g = float(g_flake_median - g_bg_corr_median)
     ndg = delta_g / max(abs(g_bg_plane_median), 1.0)
-    p10, p90 = np.percentile(delta_values, [10, 90])
+    p10, p90 = np.percentile(flake_corr_values, [10, 90])
     g_delta_iqr = float(p90 - p10)
     iqr_ndg = g_delta_iqr / max(abs(g_bg_plane_median), 1.0)
 
@@ -621,13 +680,13 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
         "delta_g": float(delta_g),
         "abs_delta_g": float(abs(delta_g)),
         "g_flake_median": g_flake_median,
-        "g_bg_plane_median": g_bg_plane_median,
+        "g_bg_plane_median": float(g_bg_plane_median),
         "g_delta_p10": float(p10),
         "g_delta_p90": float(p90),
         "g_delta_iqr": g_delta_iqr,
         "iqr_ndg": float(iqr_ndg),
         "g_bg_std": float(np.std(bg_values)),
-        "g_flake_std": float(np.std(flake_values)),
+        "g_flake_std": float(np.std(flake_corr_values)),
         "plane_a": float(a),
         "plane_b": float(b),
         "plane_c": float(c),
