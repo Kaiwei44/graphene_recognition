@@ -13,6 +13,7 @@ from typing import Iterable
 import cv2
 import joblib
 import numpy as np
+from scipy.optimize import minimize
 from sklearn.linear_model import Ridge
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, mean_absolute_error
 from sklearn.model_selection import GroupKFold, StratifiedKFold
@@ -30,7 +31,22 @@ except Exception:  # pragma: no cover
     StratifiedGroupKFold = None
 
 
-VALID_LAYERS = np.array([1, 2, 3, 4, 6, 7, 8], dtype=np.int64)
+VALID_LAYERS = np.array([1, 2, 3, 4, 6, 7], dtype=np.int64)
+ORDINAL_BOUNDARIES = VALID_LAYERS[1:].copy()
+
+LOSS_MARGIN = 0.30
+LABEL_SMOOTHING = 0.00
+L2_SCALE = 1e-3
+THRESHOLD_EPS = 1e-3
+OPT_MAX_ITER = 2000
+
+BOUNDARY_WEIGHT_MAP = {
+    2: 1.0,
+    3: 1.4,
+    4: 1.5,
+    6: 1.0,
+    7: 1.4,
+}
 
 COMPACT_BASE_FEATURES = ["ndg", "iqr_ndg", "wb1", "wb2"]
 
@@ -91,9 +107,9 @@ class GreenFeatureRow:
     plane_c: float
 
 
-class CompactOrdinalRidge:
+class CompactOrdinalBCE:
     """
-    Compact Green Ordinal Ridge, Version B.
+    Compact Green Ordinal Boundary BCE, Version C.
 
     Base features:
         ndg, iqr_ndg, wb1, wb2
@@ -108,8 +124,8 @@ class CompactOrdinalRidge:
         z_ndg * z_wb2
 
     Learned parameters:
-        8 ridge parameters: intercept + 7 coefficients
-        6 median-calibrated ordinal thresholds
+        8 score parameters: intercept + 7 coefficients
+        5 learned monotone ordinal thresholds
     """
 
     def __init__(self, alpha: float = 10.0, random_state: int = 42):
@@ -117,9 +133,19 @@ class CompactOrdinalRidge:
         self.random_state = int(random_state)
         self.feature_medians_: np.ndarray | None = None
         self.scaler_: StandardScaler | None = None
-        self.model_: Ridge | None = None
+        self.coef_: np.ndarray | None = None
+        self.intercept_: float | None = None
+        self.raw_thresholds_: np.ndarray | None = None
         self.thresholds_: np.ndarray | None = None
         self.train_medians_: dict[int, float] | None = None
+        self.boundary_weights_: np.ndarray = np.asarray(
+            [BOUNDARY_WEIGHT_MAP[int(boundary)] for boundary in ORDINAL_BOUNDARIES],
+            dtype=np.float64,
+        )
+        self.loss_margin_: float = LOSS_MARGIN
+        self.label_smoothing_: float = LABEL_SMOOTHING
+        self.gamma_: float = self.alpha * L2_SCALE
+        self.optimization_: dict | None = None
 
     @staticmethod
     def _base_matrix(rows: list[dict]) -> np.ndarray:
@@ -127,6 +153,52 @@ class CompactOrdinalRidge:
             [[float(row.get(col, float("nan"))) for col in COMPACT_BASE_FEATURES] for row in rows],
             dtype=np.float64,
         )
+
+    @staticmethod
+    def _stable_sigmoid(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        output = np.empty_like(x, dtype=np.float64)
+        positive = x >= 0
+        output[positive] = 1.0 / (1.0 + np.exp(-x[positive]))
+        exp_x = np.exp(x[~positive])
+        output[~positive] = exp_x / (1.0 + exp_x)
+        return output
+
+    @staticmethod
+    def _softplus(x: np.ndarray) -> np.ndarray:
+        return np.logaddexp(0.0, x)
+
+    @staticmethod
+    def _inverse_softplus(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        x = np.maximum(x, 1e-8)
+        return np.where(x > 20.0, x, np.log(np.expm1(x)))
+
+    @classmethod
+    def _thresholds_from_raw(cls, raw: np.ndarray) -> np.ndarray:
+        raw = np.asarray(raw, dtype=np.float64)
+        theta0 = raw[0]
+        if raw.size == 1:
+            return np.asarray([theta0], dtype=np.float64)
+        gaps = cls._softplus(raw[1:]) + THRESHOLD_EPS
+        return np.concatenate([[theta0], theta0 + np.cumsum(gaps)]).astype(np.float64)
+
+    @classmethod
+    def _raw_from_thresholds(cls, thresholds: np.ndarray) -> np.ndarray:
+        thresholds = np.asarray(thresholds, dtype=np.float64)
+        raw = np.empty_like(thresholds)
+        raw[0] = thresholds[0]
+        if thresholds.size > 1:
+            gaps = np.diff(thresholds) - THRESHOLD_EPS
+            raw[1:] = cls._inverse_softplus(np.maximum(gaps, 1e-6))
+        return raw
+
+    @staticmethod
+    def _boundary_targets(y: np.ndarray) -> np.ndarray:
+        targets = (y[:, None] >= ORDINAL_BOUNDARIES[None, :]).astype(np.float64)
+        if LABEL_SMOOTHING > 0:
+            targets = targets * (1.0 - LABEL_SMOOTHING) + 0.5 * LABEL_SMOOTHING
+        return targets
 
     @staticmethod
     def _fill_nan_with_medians(x: np.ndarray, medians: np.ndarray) -> np.ndarray:
@@ -195,20 +267,103 @@ class CompactOrdinalRidge:
         indices = np.clip(indices, 0, len(VALID_LAYERS) - 1)
         return VALID_LAYERS[indices]
 
-    def fit(self, rows: list[dict]) -> CompactOrdinalRidge:
+    def _objective_and_grad(
+        self,
+        params: np.ndarray,
+        phi: np.ndarray,
+        targets: np.ndarray,
+        sample_weight: np.ndarray,
+    ) -> tuple[float, np.ndarray]:
+        n_features = phi.shape[1]
+        w = params[:n_features]
+        intercept = params[n_features]
+        raw_thresholds = params[n_features + 1 :]
+        thresholds = self._thresholds_from_raw(raw_thresholds)
+
+        scores = phi @ w + intercept
+        logits = scores[:, None] - thresholds[None, :]
+
+        pos_arg = self.loss_margin_ - logits
+        neg_arg = logits + self.loss_margin_
+        boundary_loss = targets * self._softplus(pos_arg) + (1.0 - targets) * self._softplus(neg_arg)
+        weighted_boundary_loss = boundary_loss * self.boundary_weights_[None, :]
+        weighted_sample_loss = sample_weight * weighted_boundary_loss.sum(axis=1)
+        loss = float(np.mean(weighted_sample_loss) + self.gamma_ * np.dot(w, w))
+
+        dloss_dlogits = (
+            targets * (-self._stable_sigmoid(pos_arg))
+            + (1.0 - targets) * self._stable_sigmoid(neg_arg)
+        )
+        dloss_dlogits *= self.boundary_weights_[None, :]
+        dloss_dlogits *= sample_weight[:, None] / max(len(sample_weight), 1)
+
+        dloss_dscores = dloss_dlogits.sum(axis=1)
+        grad_w = phi.T @ dloss_dscores + 2.0 * self.gamma_ * w
+        grad_intercept = np.asarray([dloss_dscores.sum()], dtype=np.float64)
+
+        grad_thresholds = -dloss_dlogits.sum(axis=0)
+        grad_raw = np.empty_like(raw_thresholds)
+        grad_raw[0] = grad_thresholds.sum()
+        if raw_thresholds.size > 1:
+            gap_grad = self._stable_sigmoid(raw_thresholds[1:])
+            for index in range(1, raw_thresholds.size):
+                grad_raw[index] = grad_thresholds[index:].sum() * gap_grad[index - 1]
+
+        grad = np.concatenate([grad_w, grad_intercept, grad_raw])
+        return loss, grad.astype(np.float64)
+
+    def fit(self, rows: list[dict]) -> CompactOrdinalBCE:
         y = labels(rows)
+        unsupported = sorted(set(int(value) for value in y) - set(VALID_LAYERS.tolist()))
+        if unsupported:
+            raise ValueError(f"Unsupported layers for CompactOrdinalBCE: {unsupported}; valid={VALID_LAYERS.tolist()}")
+
         phi = self._make_phi_train(rows)
         sample_weight = compute_sample_weight(class_weight="balanced", y=y)
-        self.model_ = Ridge(alpha=self.alpha, random_state=self.random_state)
-        self.model_.fit(phi, y, sample_weight=sample_weight)
-        train_scores = self.model_.predict(phi)
-        self.thresholds_, self.train_medians_ = self._fit_thresholds(train_scores, y)
+
+        init_model = Ridge(alpha=self.alpha, random_state=self.random_state)
+        init_model.fit(phi, y, sample_weight=sample_weight)
+        init_scores = init_model.predict(phi)
+        init_thresholds, _ = self._fit_thresholds(init_scores, y)
+        init_raw_thresholds = self._raw_from_thresholds(init_thresholds)
+        init_params = np.concatenate(
+            [
+                np.asarray(init_model.coef_, dtype=np.float64).ravel(),
+                np.asarray([float(init_model.intercept_)], dtype=np.float64),
+                init_raw_thresholds,
+            ]
+        )
+
+        targets = self._boundary_targets(y)
+        result = minimize(
+            fun=lambda params: self._objective_and_grad(params, phi, targets, sample_weight),
+            x0=init_params,
+            method="L-BFGS-B",
+            jac=True,
+            options={"maxiter": OPT_MAX_ITER, "ftol": 1e-10, "gtol": 1e-7},
+        )
+
+        params = result.x.astype(np.float64)
+        n_features = phi.shape[1]
+        self.coef_ = params[:n_features]
+        self.intercept_ = float(params[n_features])
+        self.raw_thresholds_ = params[n_features + 1 :]
+        self.thresholds_ = self._thresholds_from_raw(self.raw_thresholds_)
+        train_scores = phi @ self.coef_ + self.intercept_
+        _, self.train_medians_ = self._fit_thresholds(train_scores, y)
+        self.optimization_ = {
+            "success": bool(result.success),
+            "status": int(result.status),
+            "message": str(result.message),
+            "nit": int(result.nit),
+            "fun": float(result.fun),
+        }
         return self
 
     def score_samples(self, rows: list[dict]) -> np.ndarray:
-        if self.model_ is None:
+        if self.coef_ is None or self.intercept_ is None:
             raise RuntimeError("Model has not been fitted")
-        return self.model_.predict(self._make_phi_predict(rows))
+        return self._make_phi_predict(rows) @ self.coef_ + self.intercept_
 
     def predict(self, rows: list[dict]) -> np.ndarray:
         if self.thresholds_ is None:
@@ -225,26 +380,40 @@ class CompactOrdinalRidge:
         return near_boundary | missing_five_zone
 
     def coefficient_rows(self) -> list[dict]:
-        if self.model_ is None:
+        if self.coef_ is None or self.intercept_ is None or self.thresholds_ is None:
             raise RuntimeError("Model has not been fitted")
-        rows = [{"feature": "intercept", "coef": float(self.model_.intercept_)}]
-        for name, coef in zip(COMPACT_PHI_FEATURES, self.model_.coef_.ravel()):
-            rows.append({"feature": name, "coef": float(coef)})
+        rows = [{"feature": "intercept", "coef": float(self.intercept_), "boundary_weight": ""}]
+        for name, coef in zip(COMPACT_PHI_FEATURES, self.coef_.ravel()):
+            rows.append({"feature": name, "coef": float(coef), "boundary_weight": ""})
+        for boundary, threshold, weight in zip(ORDINAL_BOUNDARIES, self.thresholds_, self.boundary_weights_):
+            rows.append({"feature": f"theta_layer_ge_{int(boundary)}", "coef": float(threshold), "boundary_weight": float(weight)})
         return rows
 
     def config(self) -> dict:
         return {
-            "model_name": "Compact Green Ordinal Ridge Version B",
+            "model_name": "Compact Green Ordinal Boundary BCE Version C",
             "alpha": self.alpha,
+            "gamma": self.gamma_,
+            "loss_margin": self.loss_margin_,
+            "label_smoothing": self.label_smoothing_,
+            "l2_scale": L2_SCALE,
             "base_features": COMPACT_BASE_FEATURES,
             "phi_features": COMPACT_PHI_FEATURES,
             "classes": VALID_LAYERS.tolist(),
+            "boundaries": ORDINAL_BOUNDARIES.tolist(),
+            "boundary_weights": self.boundary_weights_.tolist(),
             "thresholds": self.thresholds_.tolist() if self.thresholds_ is not None else None,
+            "raw_thresholds": self.raw_thresholds_.tolist() if self.raw_thresholds_ is not None else None,
             "train_score_medians": self.train_medians_,
             "feature_medians": self.feature_medians_.tolist() if self.feature_medians_ is not None else None,
+            "optimization": self.optimization_,
             "no_area_features_used": True,
             "no_full_polynomial_features": True,
         }
+
+
+# Backward-compatible name used by the existing train_green_ordinal.py entrypoint.
+CompactOrdinalRidge = CompactOrdinalBCE
 
 
 # -----------------------------
@@ -624,6 +793,8 @@ def coerce_rows(rows: list[dict]) -> list[dict]:
         converted["image_id"] = int(float(converted.get("image_id", -1)))
         converted["ann_id"] = int(float(converted.get("ann_id", -1)))
         converted["layer"] = int(float(converted["layer"]))
+        if converted["layer"] not in set(VALID_LAYERS.tolist()):
+            continue
         converted["area_px"] = int(float(converted.get("area_px", 0)))
         converted["roi_bg_pixels"] = int(float(converted.get("roi_bg_pixels", 0)))
         output.append(converted)
@@ -662,10 +833,12 @@ def write_json(payload: dict, path: str | os.PathLike) -> None:
 
 
 def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, review: np.ndarray | None = None) -> dict:
+    abs_error = np.abs(y_true - y_pred)
     metrics = {
         "n": int(len(y_true)),
         "exact_acc": float(accuracy_score(y_true, y_pred)),
-        "within1_acc": float(np.mean(np.abs(y_true - y_pred) <= 1)),
+        "within1_acc": float(np.mean(abs_error <= 1)),
+        "large_error_rate": float(np.mean(abs_error > 1)),
         "mae": float(mean_absolute_error(y_true, y_pred)),
         "macro_f1": float(f1_score(y_true, y_pred, labels=VALID_LAYERS, average="macro", zero_division=0)),
     }
@@ -743,12 +916,21 @@ def tune_alpha_on_rows(rows: list[dict], alphas: list[float], folds: int, seed: 
             fold_metrics.append(metrics)
 
         row = {"alpha": float(alpha), "folds": int(n_splits)}
-        for key in ["exact_acc", "within1_acc", "mae", "macro_f1", "review_rate", "kept_exact_acc"]:
+        for key in ["exact_acc", "within1_acc", "large_error_rate", "mae", "macro_f1", "review_rate", "kept_exact_acc"]:
             values = [m[key] for m in fold_metrics if key in m and np.isfinite(m[key])]
             row[f"cv_{key}"] = float(np.mean(values)) if values else float("nan")
         tuning_rows.append(row)
 
-    tuning_rows = sorted(tuning_rows, key=lambda r: (-r["cv_macro_f1"], r["cv_mae"], -r["cv_exact_acc"], r["alpha"]))
+    tuning_rows = sorted(
+        tuning_rows,
+        key=lambda r: (
+            -r["cv_exact_acc"],
+            -r["cv_macro_f1"],
+            r["cv_large_error_rate"],
+            r["cv_mae"],
+            r["alpha"],
+        ),
+    )
     return float(tuning_rows[0]["alpha"]), tuning_rows
 
 
@@ -800,8 +982,10 @@ def run_roboflow_test(
     )
 
     prediction_rows, metrics = evaluate_model(model, test_rows, boundary_margin=boundary_margin)
-    print_metrics("Compact ordinal ridge Roboflow test", metrics)
+    print_metrics("Compact ordinal boundary BCE Roboflow test", metrics)
     print(f"[INFO] alpha: {alpha}")
+    print(f"[INFO] classes: {VALID_LAYERS}")
+    print(f"[INFO] boundaries: {ORDINAL_BOUNDARIES}")
     print(f"[INFO] thresholds: {model.thresholds_}")
     print(f"[INFO] train score medians: {model.train_medians_}")
 
@@ -910,4 +1094,3 @@ def run_final(
     write_json(model.config() | {"args": args_payload}, out_dir / "model_config.json")
     joblib.dump(model, out_dir / "green_ordinal_model_final.joblib")
     print(f"[INFO] Saved final model: {out_dir / 'green_ordinal_model_final.joblib'}")
-
