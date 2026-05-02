@@ -15,10 +15,11 @@ from layer_recognition.green_ordinal import (
     ExtractConfig,
     ann_to_mask,
     build_category_to_layer,
+    dilate_boolean_mask,
     estimate_background_peak,
     estimate_flake_peak,
     expand_path,
-    fit_background_plane,
+    fit_background_plane_clipped,
     load_coco,
     parse_wb_from_filename,
     trimmed_mean,
@@ -115,6 +116,7 @@ def make_visualization(
     union_roi = union_mask[roi_slice]
     if int(np.count_nonzero(flake_roi)) < cfg.min_area_px:
         return None
+    blocked_roi = dilate_boolean_mask(union_roi.astype(bool), cfg.edge_dilate_px)
 
     green = image_bgr[:, :, 1].astype(np.float32)
     green_crop = green[roi_slice]
@@ -141,7 +143,9 @@ def make_visualization(
         candidate_source = g_smooth_bg
 
     candidate_mask = candidate_source <= cfg.bg_threshold_high
-    candidate_mask = candidate_mask & (~union_roi.astype(bool))
+    candidate_mask = candidate_mask & (~blocked_roi)
+    if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
+        candidate_mask = ~blocked_roi
     if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
         candidate_mask = ~union_roi.astype(bool)
     if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
@@ -160,7 +164,23 @@ def make_visualization(
 
     bg_y, bg_x = np.where(background_mask)
     bg_values = fit_map[background_mask]
-    a, b, c = fit_background_plane(bg_x, bg_y, bg_values, sample_max=cfg.bg_sample_max)
+    initial_bg_pixels = int(bg_values.size)
+    a, b, c, bg_keep, clip_iterations, residual_sigma = fit_background_plane_clipped(
+        bg_x,
+        bg_y,
+        bg_values,
+        sample_max=cfg.bg_sample_max,
+        min_pixels=cfg.bg_min_pixels,
+        sigma_clip=cfg.bg_residual_clip_sigma,
+        sigma_floor=cfg.bg_residual_sigma_floor,
+        max_iters=cfg.bg_residual_clip_iters,
+    )
+    clipped_background_mask = np.zeros_like(background_mask, dtype=bool)
+    clipped_background_mask[bg_y[bg_keep], bg_x[bg_keep]] = True
+    if int(np.count_nonzero(clipped_background_mask)) >= cfg.bg_min_pixels:
+        background_mask = clipped_background_mask
+        bg_y, bg_x = np.where(background_mask)
+        bg_values = fit_map[background_mask]
 
     crop_height, crop_width = green_crop.shape
     grid_x, grid_y = np.meshgrid(np.arange(crop_width, dtype=np.float32), np.arange(crop_height, dtype=np.float32))
@@ -204,6 +224,9 @@ def make_visualization(
         "bbox_w": bbox_w,
         "bbox_h": bbox_h,
         "roi_bg_pixels": int(np.count_nonzero(background_mask)),
+        "roi_bg_initial_pixels": int(initial_bg_pixels),
+        "roi_bg_clip_iterations": int(clip_iterations),
+        "roi_bg_residual_sigma": float(residual_sigma),
         "ndg": float(ndg),
         "delta_g": float(delta_g),
         "g_flake_median": g_flake_median,
@@ -229,6 +252,9 @@ def visualize(args: argparse.Namespace) -> None:
         bg_min_pixels=args.bg_min_pixels,
         bg_sample_max=args.bg_sample_max,
         edge_dilate_px=args.edge_dilate_px,
+        bg_residual_clip_sigma=args.bg_residual_clip_sigma,
+        bg_residual_clip_iters=args.bg_residual_clip_iters,
+        bg_residual_sigma_floor=args.bg_residual_sigma_floor,
         trim_low=args.trim_low,
         trim_high=args.trim_high,
     )
@@ -334,11 +360,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions-csv", default=None, help="Optional predictions CSV; exports only annotations with abs_error above threshold.")
     parser.add_argument("--min-abs-error", type=float, default=2.0)
     parser.add_argument("--max-annotations", type=int, default=80)
-    parser.add_argument("--roi-scale", type=float, default=3.0)
+    parser.add_argument("--roi-scale", type=float, default=4.0)
     parser.add_argument("--min-area-px", type=int, default=20)
     parser.add_argument("--bg-min-pixels", type=int, default=100)
-    parser.add_argument("--edge-dilate-px", type=int, default=5)
+    parser.add_argument("--edge-dilate-px", type=int, default=3)
     parser.add_argument("--bg-sample-max", type=int, default=20000)
+    parser.add_argument("--bg-residual-clip-sigma", type=float, default=2.5)
+    parser.add_argument("--bg-residual-clip-iters", type=int, default=2)
+    parser.add_argument("--bg-residual-sigma-floor", type=float, default=1.0)
     parser.add_argument("--trim-low", type=float, default=10.0)
     parser.add_argument("--trim-high", type=float, default=90.0)
     parser.add_argument(

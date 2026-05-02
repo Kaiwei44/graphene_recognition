@@ -6,6 +6,7 @@ from layer_recognition.green_ordinal import (
     COMPACT_BASE_FEATURES,
     COMPACT_PHI_FEATURES,
     ExtractConfig,
+    VALID_LAYERS,
     class_counts,
     coerce_rows,
     expand_path,
@@ -23,7 +24,7 @@ from layer_recognition.green_ordinal import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train Compact Green Ordinal Ridge model for graphene layers 1/2/3/4/6/7/8."
+        description="Train Compact Green Ordinal Boundary BCE model for graphene layers 1/2/3/4/6/7."
     )
 
     parser.add_argument("--coco-dir", type=str, default=None, help="Dataset root containing train/test/_annotations.coco.json")
@@ -49,11 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--folds", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--roi-scale", type=float, default=3.0)
+    parser.add_argument("--roi-scale", type=float, default=4.0)
     parser.add_argument("--min-area-px", type=int, default=20)
     parser.add_argument("--bg-min-pixels", type=int, default=100)
-    parser.add_argument("--edge-dilate-px", type=int, default=5)
+    parser.add_argument("--edge-dilate-px", type=int, default=3)
     parser.add_argument("--bg-sample-max", type=int, default=20000)
+    parser.add_argument("--bg-residual-clip-sigma", type=float, default=2.5)
+    parser.add_argument("--bg-residual-clip-iters", type=int, default=2)
+    parser.add_argument("--bg-residual-sigma-floor", type=float, default=1.0)
     parser.add_argument("--trim-low", type=float, default=10.0)
     parser.add_argument("--trim-high", type=float, default=90.0)
 
@@ -94,6 +98,9 @@ def main() -> None:
             bg_min_pixels=args.bg_min_pixels,
             bg_sample_max=args.bg_sample_max,
             edge_dilate_px=args.edge_dilate_px,
+            bg_residual_clip_sigma=args.bg_residual_clip_sigma,
+            bg_residual_clip_iters=args.bg_residual_clip_iters,
+            bg_residual_sigma_floor=args.bg_residual_sigma_floor,
             trim_low=args.trim_low,
             trim_high=args.trim_high,
         )
@@ -113,9 +120,10 @@ def main() -> None:
         write_csv(rows, feature_cache)
         print(f"[INFO] Saved features: {feature_cache}")
 
-    rows = [row for row in rows if int(row["layer"]) in set([1, 2, 3, 4, 6, 7, 8])]
+    valid_layer_set = set(int(layer) for layer in VALID_LAYERS.tolist())
+    rows = [row for row in rows if int(row["layer"]) in valid_layer_set]
     if not rows:
-        raise RuntimeError("No usable rows after filtering layers 1/2/3/4/6/7/8")
+        raise RuntimeError(f"No usable rows after filtering layers {sorted(valid_layer_set)}")
 
     print("[INFO] Layer counts by split:")
     for split, counts in split_counts(rows).items():

@@ -64,11 +64,11 @@ COMPACT_PHI_FEATURES = [
 
 @dataclass(slots=True)
 class ExtractConfig:
-    roi_scale: float = 3.0
+    roi_scale: float = 4.0
     min_area_px: int = 20
     bg_min_pixels: int = 100
     bg_sample_max: int = 20000
-    edge_dilate_px: int = 5
+    edge_dilate_px: int = 3
     trim_low: float = 10.0
     trim_high: float = 90.0
     bg_bilateral_sigma_color: float = 10.0
@@ -79,6 +79,9 @@ class ExtractConfig:
     bg_peak_bins: int = 256
     bg_tol_low: float = 3.0
     bg_tol_high: float = 3.0
+    bg_residual_clip_sigma: float = 2.5
+    bg_residual_clip_iters: int = 2
+    bg_residual_sigma_floor: float = 1.0
 
 
 @dataclass(slots=True)
@@ -100,6 +103,9 @@ class GreenFeatureRow:
     bbox_h: float
     bbox_aspect: float
     roi_bg_pixels: int
+    roi_bg_initial_pixels: int
+    roi_bg_clip_iterations: int
+    roi_bg_residual_sigma: float
     ndg: float
     delta_g: float
     abs_delta_g: float
@@ -545,6 +551,21 @@ def trimmed_mean(values: np.ndarray, low: float = 10.0, high: float = 90.0) -> f
     return float(np.mean(trimmed))
 
 
+def _least_squares_plane(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, sample_max: int) -> tuple[float, float, float]:
+    if values.size < 3:
+        constant = float(np.nanmedian(values)) if values.size else 0.0
+        return 0.0, 0.0, constant
+
+    if values.size > sample_max:
+        rng = np.random.default_rng(12345)
+        indices = rng.choice(values.size, size=sample_max, replace=False)
+        xs, ys, values = xs[indices], ys[indices], values[indices]
+
+    design = np.column_stack([xs, ys, np.ones_like(xs)])
+    coefs, *_ = np.linalg.lstsq(design, values, rcond=None)
+    return float(coefs[0]), float(coefs[1]), float(coefs[2])
+
+
 def fit_background_plane(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, sample_max: int) -> tuple[float, float, float]:
     xs = xs.astype(np.float32)
     ys = ys.astype(np.float32)
@@ -558,14 +579,94 @@ def fit_background_plane(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, sam
     lo, hi = np.percentile(values, [5, 95])
     keep = (values >= lo) & (values <= hi)
     xs, ys, values = xs[keep], ys[keep], values[keep]
-    if values.size > sample_max:
-        rng = np.random.default_rng(12345)
-        indices = rng.choice(values.size, size=sample_max, replace=False)
-        xs, ys, values = xs[indices], ys[indices], values[indices]
+    return _least_squares_plane(xs, ys, values, sample_max)
 
-    design = np.column_stack([xs, ys, np.ones_like(xs)])
-    coefs, *_ = np.linalg.lstsq(design, values, rcond=None)
-    return float(coefs[0]), float(coefs[1]), float(coefs[2])
+
+def _mad_sigma(values: np.ndarray, sigma_floor: float) -> float:
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float(sigma_floor)
+    center = float(np.median(values))
+    mad = float(np.median(np.abs(values - center)))
+    sigma = 1.4826 * mad
+    return max(float(sigma), float(sigma_floor))
+
+
+def fit_background_plane_clipped(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    values: np.ndarray,
+    sample_max: int,
+    min_pixels: int,
+    sigma_clip: float,
+    sigma_floor: float,
+    max_iters: int,
+) -> tuple[float, float, float, np.ndarray, int, float]:
+    xs_in = np.asarray(xs, dtype=np.float32)
+    ys_in = np.asarray(ys, dtype=np.float32)
+    values_in = np.asarray(values, dtype=np.float32)
+    finite = np.isfinite(values_in)
+    keep_full = np.zeros(values_in.shape, dtype=bool)
+
+    valid_indices = np.where(finite)[0]
+    xs = xs_in[finite]
+    ys = ys_in[finite]
+    values = values_in[finite]
+    if values.size < 3:
+        constant = float(np.nanmedian(values)) if values.size else 0.0
+        keep_full[valid_indices] = True
+        return 0.0, 0.0, constant, keep_full, 0, float("nan")
+
+    keep = np.ones(values.shape, dtype=bool)
+    if values.size >= max(10, min_pixels):
+        lo, hi = np.percentile(values, [5, 95])
+        trimmed = (values >= lo) & (values <= hi)
+        if int(np.count_nonzero(trimmed)) >= max(3, min_pixels):
+            keep = trimmed
+
+    base_span_x = float(np.ptp(xs[keep])) if int(np.count_nonzero(keep)) else 0.0
+    base_span_y = float(np.ptp(ys[keep])) if int(np.count_nonzero(keep)) else 0.0
+    clip_iterations = 0
+    residual_sigma = float("nan")
+
+    for _ in range(max(0, int(max_iters))):
+        a, b, c = _least_squares_plane(xs[keep], ys[keep], values[keep], sample_max)
+        residuals = values - (a * xs + b * ys + c)
+        active_residuals = residuals[keep]
+        center = float(np.median(active_residuals))
+        residual_sigma = _mad_sigma(active_residuals - center, sigma_floor)
+        next_keep = keep & (np.abs(residuals - center) <= sigma_clip * residual_sigma)
+
+        next_count = int(np.count_nonzero(next_keep))
+        if next_count < max(3, min_pixels):
+            break
+
+        if base_span_x > 0 and float(np.ptp(xs[next_keep])) < 0.35 * base_span_x:
+            break
+        if base_span_y > 0 and float(np.ptp(ys[next_keep])) < 0.35 * base_span_y:
+            break
+
+        if np.array_equal(next_keep, keep):
+            break
+
+        keep = next_keep
+        clip_iterations += 1
+
+    a, b, c = _least_squares_plane(xs[keep], ys[keep], values[keep], sample_max)
+    final_residuals = values[keep] - (a * xs[keep] + b * ys[keep] + c)
+    if final_residuals.size:
+        residual_sigma = _mad_sigma(final_residuals - float(np.median(final_residuals)), sigma_floor)
+    keep_full[valid_indices[keep]] = True
+    return a, b, c, keep_full, clip_iterations, float(residual_sigma)
+
+
+def dilate_boolean_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
+    radius = max(0, int(radius_px))
+    if radius == 0 or not np.any(mask):
+        return mask.astype(bool)
+    kernel_size = 2 * radius + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    return cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
 
 
 def estimate_background_peak(values: np.ndarray, num_bins: int) -> float:
@@ -614,6 +715,7 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
     union_crop = union_mask[roi_slice]
     if int(np.count_nonzero(annotation_crop)) < cfg.min_area_px:
         return None
+    blocked_crop = dilate_boolean_mask(union_crop.astype(bool), cfg.edge_dilate_px)
 
     green_crop = image_bgr[roi_slice][:, :, 1].astype(np.float32)
     g_smooth_bg = cv2.bilateralFilter(
@@ -630,7 +732,9 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
     )
 
     candidate_mask = g_smooth_bg <= cfg.bg_threshold_high
-    candidate_mask = candidate_mask & (~union_crop.astype(bool))
+    candidate_mask = candidate_mask & (~blocked_crop)
+    if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
+        candidate_mask = ~blocked_crop
     if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
         candidate_mask = ~union_crop.astype(bool)
     if int(np.count_nonzero(candidate_mask)) < cfg.bg_min_pixels:
@@ -649,7 +753,23 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
 
     bg_y, bg_x = np.where(background_mask)
     bg_values = g_smooth_bg[background_mask]
-    a, b, c = fit_background_plane(bg_x, bg_y, bg_values, sample_max=cfg.bg_sample_max)
+    initial_bg_pixels = int(bg_values.size)
+    a, b, c, bg_keep, clip_iterations, residual_sigma = fit_background_plane_clipped(
+        bg_x,
+        bg_y,
+        bg_values,
+        sample_max=cfg.bg_sample_max,
+        min_pixels=cfg.bg_min_pixels,
+        sigma_clip=cfg.bg_residual_clip_sigma,
+        sigma_floor=cfg.bg_residual_sigma_floor,
+        max_iters=cfg.bg_residual_clip_iters,
+    )
+    clipped_background_mask = np.zeros_like(background_mask, dtype=bool)
+    clipped_background_mask[bg_y[bg_keep], bg_x[bg_keep]] = True
+    if int(np.count_nonzero(clipped_background_mask)) >= cfg.bg_min_pixels:
+        background_mask = clipped_background_mask
+        bg_y, bg_x = np.where(background_mask)
+        bg_values = g_smooth_bg[background_mask]
 
     crop_height, crop_width = green_crop.shape
     grid_x, grid_y = np.meshgrid(np.arange(crop_width, dtype=np.float32), np.arange(crop_height, dtype=np.float32))
@@ -676,6 +796,9 @@ def extract_one_annotation_features(image_bgr: np.ndarray, annotation_mask: np.n
         "bbox_h": float(bbox_h),
         "bbox_aspect": float(bbox_w / max(bbox_h, 1)),
         "roi_bg_pixels": int(np.count_nonzero(background_mask)),
+        "roi_bg_initial_pixels": int(initial_bg_pixels),
+        "roi_bg_clip_iterations": int(clip_iterations),
+        "roi_bg_residual_sigma": float(residual_sigma),
         "ndg": float(ndg),
         "delta_g": float(delta_g),
         "abs_delta_g": float(abs(delta_g)),
