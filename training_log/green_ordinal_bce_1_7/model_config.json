@@ -1,0 +1,129 @@
+{
+  "model_name": "Compact Green Ordinal Boundary BCE Version C",
+  "alpha": 30.0,
+  "gamma": 0.03,
+  "loss_margin": 0.3,
+  "label_smoothing": 0.0,
+  "l2_scale": 0.001,
+  "base_features": [
+    "ndg",
+    "iqr_ndg",
+    "wb1",
+    "wb2"
+  ],
+  "phi_features": [
+    "z_ndg",
+    "z_ndg2",
+    "z_iqr",
+    "z_wb1",
+    "z_wb2",
+    "z_ndg_wb1",
+    "z_ndg_wb2"
+  ],
+  "classes": [
+    1,
+    2,
+    3,
+    4,
+    6,
+    7
+  ],
+  "boundaries": [
+    2,
+    3,
+    4,
+    6,
+    7
+  ],
+  "boundary_weights": [
+    1.0,
+    1.4,
+    1.5,
+    1.0,
+    1.4
+  ],
+  "thresholds": [
+    0.9897531141752439,
+    2.779102884517342,
+    4.444661978430004,
+    6.4521965573136715,
+    9.015740344494333
+  ],
+  "raw_thresholds": [
+    0.9897531141752439,
+    1.605344876422156,
+    1.4547338443676356,
+    1.8621400441783797,
+    2.482300353864202
+  ],
+  "train_score_medians": {
+    "1": 0.5711554847906593,
+    "2": 1.8130284125512954,
+    "3": 3.6676602783209793,
+    "4": 4.774553187902592,
+    "6": 7.596595085863245,
+    "7": 10.293836643552117
+  },
+  "feature_medians": [
+    -0.15721479411707723,
+    0.0985547651379821,
+    1.7,
+    3.9
+  ],
+  "optimization": {
+    "success": true,
+    "status": 0,
+    "message": "CONVERGENCE: REL_REDUCTION_OF_F_<=_FACTR*EPSMCH",
+    "nit": 26,
+    "fun": 1.776178519394172
+  },
+  "no_area_features_used": true,
+  "no_full_polynomial_features": true,
+  "args": {
+    "coco_dir": null,
+    "train_image_dir": "/mnt/tf_data/TechFin/home/group_6/Data/white_balance_copy_layers.v9-10x.coco-segmentation/train",
+    "train_coco": "/mnt/tf_data/TechFin/home/group_6/Data/white_balance_copy_layers.v9-10x.coco-segmentation/train/_annotations.coco.json",
+    "valid_image_dir": null,
+    "valid_coco": null,
+    "test_image_dir": "/mnt/tf_data/TechFin/home/group_6/Data/white_balance_copy_layers.v9-10x.coco-segmentation/test",
+    "test_coco": "/mnt/tf_data/TechFin/home/group_6/Data/white_balance_copy_layers.v9-10x.coco-segmentation/test/_annotations.coco.json",
+    "out_dir": "training_log/green_ordinal_bce_1_7",
+    "mode": "roboflow_test",
+    "feature_cache": "/mnt/tf_data/TechFin/home/group_6/MaskTerial-main/training_log/green_ordinal_bce_1_7/features.csv",
+    "force_extract": true,
+    "tune": true,
+    "alpha": 10.0,
+    "alpha_grid": "0.3,1,3,10,30,100",
+    "boundary_margin": 0.2,
+    "folds": 4,
+    "seed": 42,
+    "roi_scale": 3.0,
+    "min_area_px": 20,
+    "bg_min_pixels": 100,
+    "edge_dilate_px": 5,
+    "bg_sample_max": 20000,
+    "trim_low": 10.0,
+    "trim_high": 90.0,
+    "regressor": null,
+    "degree": null,
+    "ridge_alpha": null,
+    "huber_alpha": null,
+    "huber_epsilon": null,
+    "features": null,
+    "model_base_features": [
+      "ndg",
+      "iqr_ndg",
+      "wb1",
+      "wb2"
+    ],
+    "model_phi_features": [
+      "z_ndg",
+      "z_ndg2",
+      "z_iqr",
+      "z_wb1",
+      "z_wb2",
+      "z_ndg_wb1",
+      "z_ndg_wb2"
+    ]
+  }
+}
