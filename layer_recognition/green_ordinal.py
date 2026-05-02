@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import shutil
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -877,6 +878,69 @@ def print_metrics(title: str, metrics: dict) -> None:
             print(f"  {key}: {value}")
 
 
+def safe_filename(text: str, max_len: int = 140) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text)).strip("._")
+    if not text:
+        text = "item"
+    return text[:max_len]
+
+
+def export_large_error_images(
+    prediction_rows: list[dict],
+    out_dir: Path,
+    subdir: str = "large_error_images",
+    min_abs_error: float = 2.0,
+) -> None:
+    error_rows = [row for row in prediction_rows if float(row.get("abs_error", 0.0)) >= min_abs_error]
+    if not error_rows:
+        return
+
+    image_out_dir = out_dir / subdir
+    image_out_dir.mkdir(parents=True, exist_ok=True)
+    index_rows = []
+    for index, row in enumerate(error_rows, start=1):
+        src = Path(str(row.get("image_path", "")))
+        ext = src.suffix.lower() if src.suffix else ".jpg"
+        out_name = safe_filename(
+            f"{index:03d}_gt{int(row['layer'])}_pred{int(row['pred_layer'])}"
+            f"_err{float(row['abs_error']):.0f}_score{float(row['score']):.3f}"
+            f"_ann{int(row.get('ann_id', -1))}_{Path(str(row.get('filename', 'image'))).stem}"
+        ) + ext
+        dst = image_out_dir / out_name
+
+        image = cv2.imread(str(src), cv2.IMREAD_COLOR)
+        if image is not None:
+            label = (
+                f"gt={int(row['layer'])} pred={int(row['pred_layer'])} "
+                f"err={float(row['abs_error']):.0f} score={float(row['score']):.3f} "
+                f"ann={int(row.get('ann_id', -1))}"
+            )
+            cv2.rectangle(image, (0, 0), (min(image.shape[1], 900), 44), (255, 255, 255), thickness=-1)
+            cv2.putText(image, label, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.imwrite(str(dst), image)
+        elif src.exists():
+            shutil.copy2(src, dst)
+        else:
+            dst = Path("")
+
+        out_row = {
+            "exported_image": str(dst),
+            "source_image": str(src),
+            "filename": row.get("filename", ""),
+            "image_id": row.get("image_id", ""),
+            "ann_id": row.get("ann_id", ""),
+            "layer": int(row["layer"]),
+            "pred_layer": int(row["pred_layer"]),
+            "score": float(row["score"]),
+            "abs_error": float(row["abs_error"]),
+            "review": row.get("review", ""),
+        }
+        index_rows.append(out_row)
+
+    write_csv(index_rows, image_out_dir / "index.csv")
+    print(f"[INFO] Exported {len(index_rows)} large-error images to {image_out_dir}")
+
+
 def evaluate_model(model: CompactOrdinalRidge, test_rows: list[dict], boundary_margin: float) -> tuple[list[dict], dict]:
     y_true = labels(test_rows)
     scores = model.score_samples(test_rows)
@@ -981,6 +1045,12 @@ def run_roboflow_test(
         tuning_csv_path=out_dir / "alpha_tuning_train_cv.csv" if tune else None,
     )
 
+    train_prediction_rows, train_metrics = evaluate_model(model, train_rows, boundary_margin=boundary_margin)
+    print_metrics("Compact ordinal boundary BCE train self-fit", train_metrics)
+    write_csv(train_prediction_rows, out_dir / "train_predictions.csv")
+    write_json(train_metrics, out_dir / "train_self_metrics.json")
+    export_large_error_images(train_prediction_rows, out_dir, subdir="train_large_error_images")
+
     prediction_rows, metrics = evaluate_model(model, test_rows, boundary_margin=boundary_margin)
     print_metrics("Compact ordinal boundary BCE Roboflow test", metrics)
     print(f"[INFO] alpha: {alpha}")
@@ -990,6 +1060,7 @@ def run_roboflow_test(
     print(f"[INFO] train score medians: {model.train_medians_}")
 
     write_csv(prediction_rows, out_dir / "test_predictions.csv")
+    export_large_error_images(prediction_rows, out_dir, subdir="test_large_error_images")
     y_true = labels(prediction_rows)
     y_pred = np.asarray([int(row["pred_layer"]) for row in prediction_rows], dtype=np.int64)
     write_csv(confusion_rows(y_true, y_pred), out_dir / "test_confusion_matrix.csv")
@@ -1055,6 +1126,7 @@ def run_cv(
         print_metrics(f"Fold {fold}", metrics)
 
     write_csv(all_predictions, out_dir / "cv_predictions.csv")
+    export_large_error_images(all_predictions, out_dir, subdir="cv_large_error_images")
     write_csv(fold_metrics, out_dir / "cv_metrics_by_fold.csv")
     y_true = labels(all_predictions)
     y_pred = np.asarray([int(row["pred_layer"]) for row in all_predictions], dtype=np.int64)
@@ -1089,6 +1161,7 @@ def run_final(
     prediction_rows, metrics = evaluate_model(model, rows, boundary_margin=boundary_margin)
     print_metrics("Final self-fit, not validation", metrics)
     write_csv(prediction_rows, out_dir / "trainset_self_predictions.csv")
+    export_large_error_images(prediction_rows, out_dir, subdir="final_large_error_images")
     write_csv(model.coefficient_rows(), out_dir / "coefficients.csv")
     write_json(metrics, out_dir / "final_self_metrics.json")
     write_json(model.config() | {"args": args_payload}, out_dir / "model_config.json")
