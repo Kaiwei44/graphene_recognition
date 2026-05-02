@@ -470,8 +470,8 @@ def parse_layer_from_category(name: str) -> int | None:
     text = str(name).strip().lower()
     if text.isdigit():
         value = int(text)
-        return value if 1 <= value <= 8 else None
-    numbers = re.findall(r"(?<!\d)([1-8])(?!\d)", text)
+        return value if 1 <= value <= 20 else None
+    numbers = re.findall(r"(?<!\d)([1-9]|1[0-9]|20)(?!\d)", text)
     if numbers:
         return int(numbers[0])
     return None

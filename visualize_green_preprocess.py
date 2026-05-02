@@ -88,6 +88,7 @@ def make_visualization(
     annotation_mask: np.ndarray,
     union_mask: np.ndarray,
     cfg: ExtractConfig,
+    fit_source: str,
 ) -> tuple[np.ndarray, dict] | None:
     height, width = annotation_mask.shape
     area_px = int(np.count_nonzero(annotation_mask))
@@ -130,13 +131,13 @@ def make_visualization(
         sigmaSpace=cfg.flake_bilateral_sigma_space,
     )
 
-    if cfg.fit_source == "raw":
+    if fit_source == "raw":
         fit_map = green_crop
         flake_map = green_crop
         candidate_source = green_crop
     else:
         fit_map = g_smooth_bg
-        flake_map = g_smooth_flake if cfg.fit_source == "training" else g_smooth_bg
+        flake_map = g_smooth_flake if fit_source == "training" else g_smooth_bg
         candidate_source = g_smooth_bg
 
     candidate_mask = candidate_source <= cfg.bg_threshold_high
@@ -195,7 +196,7 @@ def make_visualization(
     panels = [
         label_panel(resize_panel(raw_green, panel_size), "raw green channel"),
         label_panel(resize_panel(bilateral_green, panel_size), "green after bilateral filter"),
-        label_panel(resize_panel(plane_vis, panel_size), f"regressed background plane ({cfg.fit_source})"),
+        label_panel(resize_panel(plane_vis, panel_size), f"regressed background plane ({fit_source})"),
         label_panel(resize_panel(delta_vis, panel_size), f"flake mask: corrected green - background"),
     ]
     stats = {
@@ -231,7 +232,6 @@ def visualize(args: argparse.Namespace) -> None:
         trim_low=args.trim_low,
         trim_high=args.trim_high,
     )
-    cfg.fit_source = args.fit_source
     image_dir = expand_path(args.image_dir)
     out_dir = expand_path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -291,7 +291,7 @@ def visualize(args: argparse.Namespace) -> None:
         for annotation, layer, mask in decoded:
             if exported >= args.max_annotations:
                 break
-            result = make_visualization(image_bgr, mask, union_mask, cfg)
+            result = make_visualization(image_bgr, mask, union_mask, cfg, args.fit_source)
             if result is None:
                 continue
             canvas, stats = result
