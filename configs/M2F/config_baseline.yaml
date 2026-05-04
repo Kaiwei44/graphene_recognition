@@ -29,12 +29,12 @@ MODEL:
     TRANSFORMER_DECODER_NAME: "MultiScaleMaskedTransformerDecoder"
     TRANSFORMER_IN_FEATURE: "multi_scale_pixel_decoder"
     DEEP_SUPERVISION: True
-    NO_OBJECT_WEIGHT: 0.4
+    NO_OBJECT_WEIGHT: 0.1
     CLASS_WEIGHT: 2.0
     MASK_WEIGHT: 5.0
     DICE_WEIGHT: 5.0
     HIDDEN_DIM: 256
-    NUM_OBJECT_QUERIES: 20  #100
+    NUM_OBJECT_QUERIES: 100
     NHEADS: 8
     DROPOUT: 0.0
     DIM_FEEDFORWARD: 2048
@@ -56,32 +56,18 @@ MODEL:
     FREEZE_AT: 10 # freeze the entire backbone
     NAME: "build_resnet_backbone"
   RESNETS:
-    DEPTH: 50  
+    DEPTH: 50
     STEM_OUT_CHANNELS: 64
     STRIDE_IN_1X1: False
     OUT_FEATURES: ["res2", "res3", "res4", "res5"]
 SOLVER:
-  IMS_PER_BATCH: 32
- 
-  #BASE_LR: 0.00001
-  #MAX_ITER: 1000 #(500次迭代似乎不能使loss收敛，适当调大)
-  #CHECKPOINT_PERIOD: 10000
-  #WEIGHT_DECAY: 0.05
-  #WARMUP_FACTOR: 1.0 # disable warmup
-  #WARMUP_ITERS: 0
-
-  # --- 学习率策略核心区 ---
-  BASE_LR: 0.00005  # 初始学习率可以稍微大一点，因为后面会自动下降
-  MAX_ITER: 15000   # 大大增加总训练迭代次数，给模型充分学习的时间
-
-  LR_SCHEDULER_NAME: "WarmupCosineLR"
-
-  WARMUP_ITERS: 500     # 在前500次迭代中进行“热身”
-  WARMUP_FACTOR: 0.001 # 热身从一个很小的值开始
-  WARMUP_METHOD: "linear"
-  # --- 学习率策略结束 ---
-  CHECKPOINT_PERIOD: 5000 # 可以设一个检查点，比如每5000次保存一下模型，以防中断
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.00001
+  MAX_ITER: 12000
+  CHECKPOINT_PERIOD: 50000
   WEIGHT_DECAY: 0.05
+  WARMUP_FACTOR: 1.0 # disable warmup
+  WARMUP_ITERS: 0
   OPTIMIZER: "ADAMW"
   CLIP_GRADIENTS:
     ENABLED: True
@@ -89,16 +75,7 @@ SOLVER:
     CLIP_VALUE: 0.01
     NORM_TYPE: 2.0
   AMP:
-    ENABLED: False # 如果你的GPU支持，可以设为True来加速训练
-  
-  #OPTIMIZER: "ADAMW"
-  #CLIP_GRADIENTS:
-    #ENABLED: True
-    #CLIP_TYPE: "full_model"
-    #CLIP_VALUE: 0.01
-    #NORM_TYPE: 2.0
-  #AMP:
-    #ENABLED: False
+    ENABLED: False
 TEST:
   EVAL_PERIOD: 50000 # dont evaluate during training
 DATALOADER:
