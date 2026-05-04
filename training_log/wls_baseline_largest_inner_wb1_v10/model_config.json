@@ -1,0 +1,52 @@
+{
+  "model_name": "Green channel WLS baseline",
+  "regressor": "wls",
+  "alpha": 1.0,
+  "feature_cols": [
+    "ndg_largest_inner_median",
+    "wb1"
+  ],
+  "classes": [
+    1,
+    2,
+    3,
+    4,
+    6,
+    7
+  ],
+  "prediction_rule": "nearest valid layer from continuous regression score",
+  "class_balanced": true,
+  "standardize": false,
+  "args": {
+    "coco_dir": null,
+    "train_image_dir": null,
+    "train_coco": null,
+    "valid_image_dir": null,
+    "valid_coco": null,
+    "test_image_dir": null,
+    "test_coco": null,
+    "out_dir": "training_log/wls_baseline_largest_inner_wb1_v10",
+    "feature_cache": "training_log/green_ordinal_largest_inner_median_v10/features.csv",
+    "force_extract": false,
+    "features": "ndg_largest_inner_median,wb1",
+    "regressor": "wls",
+    "alpha": 1.0,
+    "seed": 42,
+    "class_balanced": true,
+    "standardize": false,
+    "roi_scale": 4.0,
+    "min_area_px": 20,
+    "bg_min_pixels": 100,
+    "edge_dilate_px": 3,
+    "bg_sample_max": 20000,
+    "bg_residual_clip_sigma": 2.5,
+    "bg_residual_clip_iters": 2,
+    "bg_residual_sigma_floor": 1.0,
+    "flake_rep_mode": "largest_inner_median",
+    "flake_peak_bins": 50,
+    "flake_inner_erode_px": 2,
+    "flake_min_inner_pixels": 20,
+    "trim_low": 10.0,
+    "trim_high": 90.0
+  }
+}
