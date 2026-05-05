@@ -244,7 +244,16 @@ def main():
     parser.add_argument("--sort-by", choices=["score", "area", "none"], default="score")
     parser.add_argument("--summary-csv", default=None)
     parser.add_argument("--draw-gt", action="store_true")
-    parser.add_argument("--postprocess", action="store_true")
+    parser.add_argument(
+        "--postprocess",
+        action="store_true",
+        help="Deprecated compatibility flag. Postprocessing is enabled by default.",
+    )
+    parser.add_argument(
+        "--no-postprocess",
+        action="store_true",
+        help="Disable graphene flake postprocessing and visualize raw model predictions.",
+    )
     parser.add_argument("--postprocess-vis-dir", default=None)
     parser.add_argument("--pp-overlap-iou-threshold", type=float, default=0.5)
     parser.add_argument("--pp-overlap-containment-threshold", type=float, default=0.8)
@@ -295,7 +304,9 @@ def main():
     else:
         samples = random.sample(dataset_dicts, min(args.num_samples, len(dataset_dicts)))
 
-    use_postprocess = args.postprocess or args.postprocess_vis_dir is not None
+    use_postprocess = not args.no_postprocess
+    if args.no_postprocess and args.postprocess_vis_dir is not None:
+        print("[WARN] --postprocess-vis-dir is ignored because --no-postprocess was set.")
     postprocessor = None
     if use_postprocess:
         postprocessor = GrapheneFlakePostprocessor(build_postprocess_params(args))
