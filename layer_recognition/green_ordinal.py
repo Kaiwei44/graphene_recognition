@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     StratifiedGroupKFold = None
 
 
-VALID_LAYERS = np.array([1, 2, 3, 4, 6, 7], dtype=np.int64)
+VALID_LAYERS = np.array([1, 2, 3, 4, 6, 7, 8, 9], dtype=np.int64)
 ORDINAL_BOUNDARIES = VALID_LAYERS[1:].copy()
 
 LOSS_MARGIN = 0.30
