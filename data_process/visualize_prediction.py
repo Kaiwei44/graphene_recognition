@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import random
 import sys
@@ -12,6 +13,16 @@ from detectron2.data.datasets import register_coco_instances
 from detectron2.engine import DefaultPredictor
 from detectron2.utils.visualizer import ColorMode, Visualizer
 import torch
+
+try:
+    from scipy.optimize import linear_sum_assignment
+except Exception:  # pragma: no cover
+    linear_sum_assignment = None
+
+try:
+    from pycocotools import mask as mask_utils
+except Exception:  # pragma: no cover
+    mask_utils = None
 
 from maskterial.maskterial import MaskTerial
 from maskterial.modeling.segmentation_models import M2F_model
@@ -181,6 +192,231 @@ def draw_flake_masks(image, flakes, scale: float):
     return output
 
 
+def annotation_to_mask(annotation: dict, height: int, width: int) -> np.ndarray:
+    segmentation = annotation.get("segmentation")
+    if segmentation is None:
+        mask = np.zeros((height, width), dtype=np.uint8)
+        x, y, w, h = annotation.get("bbox", [0, 0, 0, 0])
+        x0 = int(max(0, np.floor(x)))
+        y0 = int(max(0, np.floor(y)))
+        x1 = int(min(width, np.ceil(x + w)))
+        y1 = int(min(height, np.ceil(y + h)))
+        mask[y0:y1, x0:x1] = 1
+        return mask.astype(bool)
+
+    if mask_utils is None:
+        raise ImportError("pycocotools is required to evaluate segmentation masks")
+
+    if isinstance(segmentation, list):
+        rles = mask_utils.frPyObjects(segmentation, height, width)
+        rle = mask_utils.merge(rles)
+        decoded = mask_utils.decode(rle)
+    elif isinstance(segmentation, dict):
+        rle = segmentation
+        if isinstance(rle.get("counts"), list):
+            rle = mask_utils.frPyObjects(rle, height, width)
+        decoded = mask_utils.decode(rle)
+    else:
+        raise ValueError(f"Unsupported segmentation type: {type(segmentation)}")
+
+    if decoded.ndim == 3:
+        decoded = np.any(decoded, axis=2)
+    return decoded.astype(bool)
+
+
+def gt_masks_from_dataset_dict(dataset_dict: dict, height: int, width: int, min_area_px: int):
+    gt_masks = []
+    for annotation in dataset_dict.get("annotations", []):
+        if int(annotation.get("iscrowd", 0)):
+            continue
+        mask = annotation_to_mask(annotation, height, width)
+        if int(np.count_nonzero(mask)) < min_area_px:
+            continue
+        gt_masks.append(mask.astype(bool))
+    return gt_masks
+
+
+def pred_masks_from_flakes(flakes):
+    return [(np.asarray(flake.mask) > 0).astype(bool) for flake in flakes]
+
+
+def pairwise_intersection_iou(gt_masks, pred_masks):
+    if not gt_masks or not pred_masks:
+        return (
+            np.zeros((len(gt_masks), len(pred_masks)), dtype=np.float32),
+            np.zeros((len(gt_masks), len(pred_masks)), dtype=np.float32),
+            np.asarray([int(np.count_nonzero(mask)) for mask in gt_masks], dtype=np.float32),
+            np.asarray([int(np.count_nonzero(mask)) for mask in pred_masks], dtype=np.float32),
+        )
+
+    gt_areas = np.asarray([int(np.count_nonzero(mask)) for mask in gt_masks], dtype=np.float32)
+    pred_areas = np.asarray([int(np.count_nonzero(mask)) for mask in pred_masks], dtype=np.float32)
+    intersections = np.zeros((len(gt_masks), len(pred_masks)), dtype=np.float32)
+    for gt_index, gt_mask in enumerate(gt_masks):
+        for pred_index, pred_mask in enumerate(pred_masks):
+            intersections[gt_index, pred_index] = int(np.count_nonzero(gt_mask & pred_mask))
+    unions = gt_areas[:, None] + pred_areas[None, :] - intersections
+    ious = np.divide(
+        intersections,
+        np.maximum(unions, 1.0),
+        out=np.zeros_like(intersections, dtype=np.float32),
+        where=unions > 0,
+    )
+    return intersections, ious, gt_areas, pred_areas
+
+
+def match_instances_by_iou(ious: np.ndarray, iou_threshold: float) -> tuple[set[int], set[int]]:
+    matched_gt: set[int] = set()
+    matched_pred: set[int] = set()
+    if ious.size == 0:
+        return matched_gt, matched_pred
+
+    if linear_sum_assignment is not None:
+        row_ind, col_ind = linear_sum_assignment(-ious)
+        pairs = zip(row_ind, col_ind)
+    else:
+        candidate_indices = np.argwhere(ious >= iou_threshold)
+        order = np.argsort(-ious[candidate_indices[:, 0], candidate_indices[:, 1]])
+        pairs = ((candidate_indices[i, 0], candidate_indices[i, 1]) for i in order)
+
+    for gt_index, pred_index in pairs:
+        gt_index = int(gt_index)
+        pred_index = int(pred_index)
+        if gt_index in matched_gt or pred_index in matched_pred:
+            continue
+        if ious[gt_index, pred_index] < iou_threshold:
+            continue
+        matched_gt.add(gt_index)
+        matched_pred.add(pred_index)
+    return matched_gt, matched_pred
+
+
+def evaluate_flake_predictions(
+    dataset_dict: dict,
+    flakes,
+    image_shape: tuple[int, int],
+    args,
+) -> dict:
+    height, width = image_shape
+    gt_masks = gt_masks_from_dataset_dict(
+        dataset_dict,
+        height=height,
+        width=width,
+        min_area_px=args.eval_min_gt_area_px,
+    )
+    pred_masks = pred_masks_from_flakes(flakes)
+    intersections, ious, gt_areas, pred_areas = pairwise_intersection_iou(gt_masks, pred_masks)
+
+    matched_gt, matched_pred = match_instances_by_iou(ious, args.eval_iou_threshold)
+
+    tp = len(matched_gt)
+    fp = len(pred_masks) - len(matched_pred)
+    fn = len(gt_masks) - len(matched_gt)
+
+    if len(gt_masks) and len(pred_masks):
+        covered_pixels = intersections.sum(axis=1)
+        hit_coverages = covered_pixels / np.maximum(gt_areas, 1.0)
+        hit_flags = hit_coverages >= args.eval_hit_coverage_threshold
+        significant = intersections / np.maximum(
+            np.minimum(gt_areas[:, None], pred_areas[None, :]),
+            1.0,
+        )
+        fragment_counts = (significant >= args.eval_significant_overlap_threshold).sum(axis=1)
+        gt_per_pred = (significant >= args.eval_significant_overlap_threshold).sum(axis=0)
+    else:
+        hit_coverages = np.zeros(len(gt_masks), dtype=np.float32)
+        hit_flags = np.zeros(len(gt_masks), dtype=bool)
+        fragment_counts = np.zeros(len(gt_masks), dtype=np.int64)
+        gt_per_pred = np.zeros(len(pred_masks), dtype=np.int64)
+
+    hit_count = int(np.count_nonzero(hit_flags))
+    split_gt_count = int(np.count_nonzero((fragment_counts > 1) & hit_flags))
+    fragment_sum_hit = int(fragment_counts[hit_flags].sum()) if hit_count else 0
+    max_fragments = int(fragment_counts.max()) if len(fragment_counts) else 0
+    merge_pred_count = int(np.count_nonzero(gt_per_pred > 1))
+    max_gt_per_pred = int(gt_per_pred.max()) if len(gt_per_pred) else 0
+
+    image_name = os.path.basename(dataset_dict["file_name"])
+    return {
+        "image": image_name,
+        "gt": int(len(gt_masks)),
+        "pred": int(len(pred_masks)),
+        "strict_tp": int(tp),
+        "strict_fp": int(fp),
+        "strict_fn": int(fn),
+        "hit_count": hit_count,
+        "split_gt_count": split_gt_count,
+        "fragment_sum_hit": fragment_sum_hit,
+        "max_fragments_per_gt": max_fragments,
+        "merge_pred_count": merge_pred_count,
+        "max_gt_per_pred": max_gt_per_pred,
+        "mean_hit_coverage": float(np.mean(hit_coverages)) if len(hit_coverages) else 0.0,
+    }
+
+
+def ratio(numerator: float, denominator: float) -> float:
+    return float(numerator / denominator) if denominator else 0.0
+
+
+def summarize_eval_rows(rows: list[dict], args) -> dict:
+    totals = {
+        "images": len(rows),
+        "gt": sum(int(row["gt"]) for row in rows),
+        "pred": sum(int(row["pred"]) for row in rows),
+        "strict_tp": sum(int(row["strict_tp"]) for row in rows),
+        "strict_fp": sum(int(row["strict_fp"]) for row in rows),
+        "strict_fn": sum(int(row["strict_fn"]) for row in rows),
+        "hit_count": sum(int(row["hit_count"]) for row in rows),
+        "split_gt_count": sum(int(row["split_gt_count"]) for row in rows),
+        "fragment_sum_hit": sum(int(row["fragment_sum_hit"]) for row in rows),
+        "merge_pred_count": sum(int(row["merge_pred_count"]) for row in rows),
+        "max_fragments_per_gt": max([int(row["max_fragments_per_gt"]) for row in rows], default=0),
+        "max_gt_per_pred": max([int(row["max_gt_per_pred"]) for row in rows], default=0),
+    }
+    precision = ratio(totals["strict_tp"], totals["strict_tp"] + totals["strict_fp"])
+    recall = ratio(totals["strict_tp"], totals["strict_tp"] + totals["strict_fn"])
+    f1 = ratio(2 * precision * recall, precision + recall)
+    hit_recall = ratio(totals["hit_count"], totals["gt"])
+    return {
+        "eval_iou_threshold": float(args.eval_iou_threshold),
+        "eval_hit_coverage_threshold": float(args.eval_hit_coverage_threshold),
+        "eval_significant_overlap_threshold": float(args.eval_significant_overlap_threshold),
+        "eval_min_gt_area_px": int(args.eval_min_gt_area_px),
+        **totals,
+        "strict_precision": precision,
+        "strict_recall": recall,
+        "strict_f1": f1,
+        "hit_recall": hit_recall,
+        "fp_per_image": ratio(totals["strict_fp"], totals["images"]),
+        "split_rate_all_gt": ratio(totals["split_gt_count"], totals["gt"]),
+        "split_rate_hit_gt": ratio(totals["split_gt_count"], totals["hit_count"]),
+        "avg_fragments_per_hit": ratio(totals["fragment_sum_hit"], totals["hit_count"]),
+        "merge_rate_pred": ratio(totals["merge_pred_count"], totals["pred"]),
+    }
+
+
+def write_eval_outputs(rows: list[dict], outdir: str, args):
+    if not rows:
+        return
+    per_image_path = os.path.join(outdir, "evaluation_per_image.csv")
+    with open(per_image_path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    metrics = summarize_eval_rows(rows, args)
+    metrics_path = os.path.join(outdir, "evaluation_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2, ensure_ascii=False)
+
+    print(f"Evaluation metrics -> {metrics_path}")
+    print(f"Per-image evaluation -> {per_image_path}")
+    print(
+        "Strict F1={strict_f1:.4f}, Hit Recall={hit_recall:.4f}, "
+        "FP/image={fp_per_image:.4f}, Split Rate={split_rate_all_gt:.4f}".format(**metrics)
+    )
+
+
 def write_flake_rows(writer, dataset_dict, flakes):
     image_name = os.path.basename(dataset_dict["file_name"])
     for index, flake in enumerate(flakes, start=1):
@@ -270,6 +506,35 @@ def main():
     parser.add_argument("--pp-final-min-score", type=float, default=0.015)
     parser.add_argument("--pp-final-max-shape-complexity", type=float, default=5.0)
     parser.add_argument("--pp-max-bridge-passes", type=int, default=5)
+    parser.add_argument(
+        "--no-eval-metrics",
+        action="store_true",
+        help="Disable segmentation evaluation CSV/JSON generation.",
+    )
+    parser.add_argument(
+        "--eval-iou-threshold",
+        type=float,
+        default=0.5,
+        help="One-to-one IoU threshold for strict TP/FP/FN metrics.",
+    )
+    parser.add_argument(
+        "--eval-hit-coverage-threshold",
+        type=float,
+        default=0.5,
+        help="GT coverage threshold for hit recall, using all predicted masks together.",
+    )
+    parser.add_argument(
+        "--eval-significant-overlap-threshold",
+        type=float,
+        default=0.2,
+        help="Minimum overlap ratio used to count split and merge fragments.",
+    )
+    parser.add_argument(
+        "--eval-min-gt-area-px",
+        type=int,
+        default=0,
+        help="Ignore GT masks smaller than this pixel area when computing metrics.",
+    )
     parser.add_argument("opts", nargs=argparse.REMAINDER, default=[])
     args = parser.parse_args()
 
@@ -329,6 +594,7 @@ def main():
         ],
     )
     csv_writer.writeheader()
+    eval_rows = []
 
     for dataset_dict in samples:
         img = cv2.imread(dataset_dict["file_name"])
@@ -351,6 +617,15 @@ def main():
 
         flakes = sort_flakes(flakes, args.sort_by)
         write_flake_rows(csv_writer, dataset_dict, flakes)
+        if not args.no_eval_metrics:
+            eval_rows.append(
+                evaluate_flake_predictions(
+                    dataset_dict=dataset_dict,
+                    flakes=flakes,
+                    image_shape=img.shape[:2],
+                    args=args,
+                )
+            )
 
         pred_img = img
         if args.scale != 1.0:
@@ -395,6 +670,8 @@ def main():
         print(f"saved: {pred_path}")
 
     csv_file.close()
+    if not args.no_eval_metrics:
+        write_eval_outputs(eval_rows, args.outdir, args)
     print(f"All done. -> {args.outdir}")
     print(f"Prediction table -> {csv_path}")
 
