@@ -45,9 +45,28 @@ BOUNDARY_WEIGHT_MAP = {
     2: 1.0,
     3: 1.4,
     4: 1.5,
-    6: 1.0,
+    6: 1.0,  # 4 vs 6 when layer 5 is not supervised.
     7: 1.4,
+    8: 1.2,
+    9: 1.2,
+    10: 1.2,
 }
+
+
+def missing_layers_between_valid() -> list[int]:
+    """Return integer layer labels skipped by adjacent VALID_LAYERS entries."""
+    layers = [int(layer) for layer in VALID_LAYERS.tolist()]
+    missing: list[int] = []
+    for lower, upper in zip(layers[:-1], layers[1:]):
+        if upper <= lower:
+            continue
+        missing.extend(range(lower + 1, upper))
+    return missing
+
+
+def valid_or_gap_layer_set() -> set[int]:
+    """Layers used to build union masks: supervised layers plus skipped gap layers."""
+    return set(int(layer) for layer in VALID_LAYERS.tolist()) | set(missing_layers_between_valid())
 
 COMPACT_BASE_FEATURES = ["ndg", "iqr_ndg", "wb1", "wb2"]
 
@@ -180,6 +199,14 @@ class CompactOrdinalBCE:
         self.raw_thresholds_: np.ndarray | None = None
         self.thresholds_: np.ndarray | None = None
         self.train_medians_: dict[int, float] | None = None
+        missing_weight_boundaries = [
+            int(boundary) for boundary in ORDINAL_BOUNDARIES if int(boundary) not in BOUNDARY_WEIGHT_MAP
+        ]
+        if missing_weight_boundaries:
+            raise ValueError(
+                "BOUNDARY_WEIGHT_MAP is missing weights for ordinal boundaries: "
+                f"{missing_weight_boundaries}. Update BOUNDARY_WEIGHT_MAP after changing VALID_LAYERS."
+            )
         self.boundary_weights_: np.ndarray = np.asarray(
             [BOUNDARY_WEIGHT_MAP[int(boundary)] for boundary in ORDINAL_BOUNDARIES],
             dtype=np.float64,
@@ -418,8 +445,29 @@ class CompactOrdinalBCE:
         scores = self.score_samples(rows)
         boundary_distance = np.min(np.abs(scores[:, None] - self.thresholds_[None, :]), axis=1)
         near_boundary = boundary_distance < boundary_margin
-        missing_five_zone = (scores >= 4.5) & (scores <= 5.5)
-        return near_boundary | missing_five_zone
+        return near_boundary | self._missing_layer_review_zone(scores)
+
+    def _missing_layer_review_zone(self, scores: np.ndarray) -> np.ndarray:
+        flags = np.zeros(len(scores), dtype=bool)
+        if not self.train_medians_:
+            return flags
+
+        layers = [int(layer) for layer in VALID_LAYERS.tolist()]
+        for lower, upper in zip(layers[:-1], layers[1:]):
+            missing = list(range(lower + 1, upper))
+            if not missing or lower not in self.train_medians_ or upper not in self.train_medians_:
+                continue
+
+            lower_score = float(self.train_medians_[lower])
+            upper_score = float(self.train_medians_[upper])
+            layer_span = float(upper - lower)
+            score_span = upper_score - lower_score
+            for missing_layer in missing:
+                zone_low = lower_score + ((missing_layer - 0.5 - lower) / layer_span) * score_span
+                zone_high = lower_score + ((missing_layer + 0.5 - lower) / layer_span) * score_span
+                lo, hi = sorted((zone_low, zone_high))
+                flags |= (scores >= lo) & (scores <= hi)
+        return flags
 
     def coefficient_rows(self) -> list[dict]:
         if self.coef_ is None or self.intercept_ is None or self.thresholds_ is None:
@@ -443,6 +491,7 @@ class CompactOrdinalBCE:
             "phi_features": COMPACT_PHI_FEATURES,
             "classes": VALID_LAYERS.tolist(),
             "boundaries": ORDINAL_BOUNDARIES.tolist(),
+            "missing_layers_between_valid": missing_layers_between_valid(),
             "boundary_weights": self.boundary_weights_.tolist(),
             "thresholds": self.thresholds_.tolist() if self.thresholds_ is not None else None,
             "raw_thresholds": self.raw_thresholds_.tolist() if self.raw_thresholds_ is not None else None,
@@ -996,10 +1045,10 @@ def read_split_features(split: str, image_dir: str | os.PathLike, coco_path: str
 
         decoded: list[tuple[dict, int, np.ndarray]] = []
         union_mask = np.zeros((height, width), dtype=bool)
-        valid_or_missing_five = set(VALID_LAYERS.tolist() + [5])
+        valid_or_gap_layers = valid_or_gap_layer_set()
         for annotation in annotations:
             layer = category_to_layer.get(int(annotation.get("category_id", -1)))
-            if layer is None or layer not in valid_or_missing_five:
+            if layer is None or layer not in valid_or_gap_layers:
                 continue
             mask = ann_to_mask(annotation, height, width)
             if int(np.count_nonzero(mask)) < cfg.min_area_px:

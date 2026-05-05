@@ -12,6 +12,7 @@ from layer_recognition.green_ordinal import (
     coerce_rows,
     expand_path,
     extract_features,
+    missing_layers_between_valid,
     normalize_flake_rep_mode,
     parse_alpha_grid,
     read_csv,
@@ -143,8 +144,16 @@ def main() -> None:
     print("[INFO] Layer counts by split:")
     for split, counts in split_counts(rows).items():
         print(f"  {split}: {counts}")
-    if "5" not in class_counts(rows):
-        print("[WARN] No layer-5 samples found. Scores in 4.5-5.5 are treated as review/missing-5 zone.")
+    gap_layers = missing_layers_between_valid()
+    if gap_layers:
+        print(
+            "[WARN] VALID_LAYERS skips layer labels "
+            f"{gap_layers}. These labels are not supervised, but are included in union masks if annotated."
+        )
+    supervised_counts = class_counts(rows)
+    missing_supervised = [int(layer) for layer in VALID_LAYERS.tolist() if str(int(layer)) not in supervised_counts]
+    if missing_supervised:
+        print(f"[WARN] No samples found for supervised VALID_LAYERS entries: {missing_supervised}.")
 
     print(f"[INFO] Model base features ({len(COMPACT_BASE_FEATURES)}): {', '.join(COMPACT_BASE_FEATURES)}")
     print(f"[INFO] Model phi features ({len(COMPACT_PHI_FEATURES)}): {', '.join(COMPACT_PHI_FEATURES)}")
