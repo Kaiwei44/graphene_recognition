@@ -52,11 +52,11 @@ COLORS = np.array([
 class V3Params:
     gaussian_sigma_divisor: float = 7.0
     gaussian_sigma_min: float = 9.0
-    contrast_low: float = 7.0
+    contrast_low: float = 5.0
     contrast_high: float = 16.0
-    felz_scale_small: float = 55.0
-    felz_scale_large: float = 70.0
-    felz_sigma: float = 0.45
+    felz_scale_small: float = 60.0
+    felz_scale_large: float = 80.0
+    felz_sigma: float = 0.4
     felz_min_size_area_divisor: float = 900.0
     felz_min_size_floor: int = 18
     large_area_threshold: int = 12000
@@ -276,12 +276,12 @@ def infra_kmeans_candidate(rgb:np.ndarray, mask:np.ndarray, max_k:int=7)->np.nda
     I=corrected_infra_intensity(rgb,mask)
     vals=I[inside]
     contrast=float(np.percentile(vals,90)-np.percentile(vals,10))
-    if contrast<8:
+    if contrast<20:
         lab[inside]=1; return lab
     k=2
-    if contrast>18: k=3
-    if contrast>30: k=4
-    if contrast>45: k=5
+    if contrast>40: k=3
+    if contrast>60: k=4
+    if contrast>80: k=5
     k=min(max_k,k)
     # Use quantile thresholds for speed and stability. Multi-Otsu can be slow on larger masks.
     th=np.percentile(vals, np.linspace(0,100,k+1)[1:-1])
