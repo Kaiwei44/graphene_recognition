@@ -265,6 +265,25 @@ def pairwise_intersection_iou(gt_masks, pred_masks):
     return intersections, ious, gt_areas, pred_areas
 
 
+def gt_union_coverages(gt_masks, pred_masks, gt_areas):
+    if not gt_masks:
+        return np.zeros(0, dtype=np.float32)
+    if not pred_masks:
+        return np.zeros(len(gt_masks), dtype=np.float32)
+
+    pred_union = np.zeros_like(gt_masks[0], dtype=bool)
+    for pred_mask in pred_masks:
+        pred_union |= pred_mask
+
+    coverages = np.zeros(len(gt_masks), dtype=np.float32)
+    for gt_index, gt_mask in enumerate(gt_masks):
+        coverages[gt_index] = int(np.count_nonzero(gt_mask & pred_union)) / max(
+            float(gt_areas[gt_index]),
+            1.0,
+        )
+    return coverages
+
+
 def match_instances_by_iou(ious: np.ndarray, iou_threshold: float) -> tuple[set[int], set[int]]:
     matched_gt: set[int] = set()
     matched_pred: set[int] = set()
@@ -314,8 +333,7 @@ def evaluate_flake_predictions(
     fn = len(gt_masks) - len(matched_gt)
 
     if len(gt_masks) and len(pred_masks):
-        covered_pixels = intersections.sum(axis=1)
-        hit_coverages = covered_pixels / np.maximum(gt_areas, 1.0)
+        hit_coverages = gt_union_coverages(gt_masks, pred_masks, gt_areas)
         hit_flags = hit_coverages >= args.eval_hit_coverage_threshold
         significant = intersections / np.maximum(
             np.minimum(gt_areas[:, None], pred_areas[None, :]),
