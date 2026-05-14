@@ -1,0 +1,31 @@
+{
+  "input_dir": "D:\\Desktop\\infrared\\infrared detection.v2-pair_v2.coco-segmentation\\train",
+  "input_annotation": "D:\\Desktop\\infrared\\infrared detection.v2-pair_v2.coco-segmentation\\train\\_annotations.coco.json",
+  "segmentation_work_dir": "D:\\PycharmProjects\\graphene_recognition\\training_log\\infrared_detection\\v13_aggressive_raw_canny_gate",
+  "output_coco": "C:\\Users\\m1309\\Downloads\\has_abc_area_erode_test\\has_ABC_annotations.coco.json",
+  "big_category": "gra",
+  "has_abc_category": "has_ABC",
+  "abc_params": {
+    "erode_px": 2,
+    "trim_low": 5.0,
+    "trim_high": 95.0,
+    "gaussian_sigma": 0.5,
+    "min_gray_delta": 0.0,
+    "max_gray_delta": 55.0,
+    "min_minority_frac": 0.25,
+    "min_effective_px": 20,
+    "minority_frac_erode_px": 2,
+    "boundary_prefilter_delta": 80.0,
+    "disable_boundary_prefilter": false
+  },
+  "assignment_params": {
+    "min_subpart_overlap_frac": 0.2,
+    "min_overlap_px": 20
+  },
+  "counts": {
+    "subparts_checked": 23,
+    "selected_annotations": 10,
+    "output_images": 10,
+    "kmeans_visualizations": 10
+  }
+}

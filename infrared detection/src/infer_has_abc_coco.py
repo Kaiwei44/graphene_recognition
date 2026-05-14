@@ -75,6 +75,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-gray-delta", type=float, default=0.0)
     ap.add_argument("--min-minority-frac", type=float, default=0.25)
     ap.add_argument("--min-effective-px", type=int, default=20)
+    ap.add_argument(
+        "--minority-frac-erode-px",
+        type=int,
+        default=2,
+        help="Erode the final effective mask before computing minority class fraction for acceptance.",
+    )
+    ap.add_argument(
+        "--boundary-prefilter-delta",
+        type=float,
+        default=80.0,
+        help="Run raw k=2 KMeans before erode/trim. If raw median delta is above this, remove the minority class as boundary artifact.",
+    )
+    ap.add_argument("--disable-boundary-prefilter", action="store_true")
 
     # Attribution from accepted INFRA subpart back to original RAW gra annotation.
     ap.add_argument("--min-subpart-overlap-frac", type=float, default=0.20)
@@ -145,9 +158,30 @@ def run_abc_for_subpart(
     label_id: int,
     args: argparse.Namespace,
     seed: int,
-) -> Tuple[bool, str, Optional[dict]]:
+) -> Tuple[bool, str, Optional[dict], dict]:
     mask = final_label == label_id
-    inner = abc.erode_mask(mask, args.erode_px, args.min_effective_px)
+    if args.disable_boundary_prefilter:
+        boundary_info = {
+            "boundary_prefilter_applied": 0,
+            "boundary_prefilter_delta": np.nan,
+            "boundary_prefilter_removed_frac": 0.0,
+            "boundary_prefilter_removed_class": "",
+            "boundary_prefilter_effective_px": int(mask.sum()),
+        }
+        inner = abc.erode_mask(mask, args.erode_px, args.min_effective_px)
+    else:
+        prefiltered_mask, boundary_info = abc.raw_boundary_prefilter(
+            gray,
+            mask,
+            args.boundary_prefilter_delta,
+            args.min_effective_px,
+            seed=seed + 8009,
+        )
+        inner = (
+            prefiltered_mask
+            if int(boundary_info["boundary_prefilter_applied"]) == 1
+            else abc.erode_mask(prefiltered_mask, args.erode_px, args.min_effective_px)
+        )
     result = abc.run_binary_kmeans(
         gray,
         gray_smooth,
@@ -156,14 +190,17 @@ def run_abc_for_subpart(
         args.trim_high,
         args.min_effective_px,
         seed=seed,
+        minority_frac_erode_px=args.minority_frac_erode_px,
     )
+    if result is not None:
+        result.update(boundary_info)
     accepted, reason = abc.acceptance_reason(
         result,
         args.min_gray_delta,
         args.max_gray_delta,
         args.min_minority_frac,
     )
-    return accepted, reason, result
+    return accepted, reason, result, boundary_info
 
 
 def safe_name(text: str) -> str:
@@ -364,7 +401,7 @@ def main() -> None:
         pair_subpart_rows: List[dict] = []
 
         for label_id in [int(x) for x in np.unique(final_label) if int(x) > 0]:
-            accepted, reason, result = run_abc_for_subpart(
+            accepted, reason, result, boundary_info = run_abc_for_subpart(
                 gray,
                 gray_smooth,
                 final_label,
@@ -395,7 +432,15 @@ def main() -> None:
                 "smooth_gray_median_delta": np.nan if result is None else result["smooth_median_delta"],
                 "minority_class": "" if result is None else result["minority_class"],
                 "minority_frac": np.nan if result is None else result["minority_frac"],
+                "minority_class_before_area_erode": "" if result is None else result["minority_class_before_area_erode"],
+                "minority_frac_before_area_erode": np.nan if result is None else result["minority_frac_before_area_erode"],
+                "minority_area_effective_px": 0 if result is None else result["minority_area_effective_px"],
+                "minority_frac_erode_px": args.minority_frac_erode_px,
                 "higher_gray_class": "",
+                "boundary_prefilter_applied": boundary_info["boundary_prefilter_applied"],
+                "boundary_prefilter_delta": boundary_info["boundary_prefilter_delta"],
+                "boundary_prefilter_removed_frac": boundary_info["boundary_prefilter_removed_frac"],
+                "boundary_prefilter_removed_class": boundary_info["boundary_prefilter_removed_class"],
                 "effective_px": 0 if result is None else result["effective_px"],
                 "decision": row.get("decision", ""),
                 "final_reason": row.get("final_reason", ""),
@@ -477,6 +522,9 @@ def main() -> None:
                     "max_gray_delta": args.max_gray_delta,
                     "min_minority_frac": args.min_minority_frac,
                     "min_effective_px": args.min_effective_px,
+                    "minority_frac_erode_px": args.minority_frac_erode_px,
+                    "boundary_prefilter_delta": args.boundary_prefilter_delta,
+                    "disable_boundary_prefilter": args.disable_boundary_prefilter,
                 },
                 "assignment_params": {
                     "min_subpart_overlap_frac": args.min_subpart_overlap_frac,

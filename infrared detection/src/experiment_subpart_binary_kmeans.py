@@ -58,6 +58,19 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--min-minority-frac", type=float, default=0.25)
     ap.add_argument("--min-effective-px", type=int, default=20)
+    ap.add_argument(
+        "--minority-frac-erode-px",
+        type=int,
+        default=4,
+        help="Erode the final effective mask before computing minority class fraction for acceptance.",
+    )
+    ap.add_argument(
+        "--boundary-prefilter-delta",
+        type=float,
+        default=80.0,
+        help="Run raw k=2 KMeans before erode/trim. If raw median delta is above this, remove the minority class as boundary artifact.",
+    )
+    ap.add_argument("--disable-boundary-prefilter", action="store_true")
     return ap.parse_args()
 
 
@@ -107,6 +120,78 @@ def bbox_from_mask(mask: np.ndarray, pad: int = 8) -> Tuple[int, int, int, int]:
     return y0, y1, x0, x1
 
 
+def raw_boundary_prefilter(
+    gray_raw: np.ndarray,
+    mask: np.ndarray,
+    max_boundary_delta: float,
+    min_effective_px: int,
+    seed: int,
+) -> Tuple[np.ndarray, dict]:
+    """Remove a very high-contrast minority class before the final shade KMeans.
+
+    This first pass intentionally uses the raw subpart mask and raw gray values only:
+    no erode, no percentile trim, no smoothing.
+    """
+    valid = mask.astype(bool)
+    vals = gray_raw[valid].astype(np.float32)
+    info = {
+        "boundary_prefilter_applied": 0,
+        "boundary_prefilter_delta": np.nan,
+        "boundary_prefilter_removed_frac": 0.0,
+        "boundary_prefilter_removed_class": "",
+        "boundary_prefilter_effective_px": int(vals.size),
+    }
+    if vals.size < min_effective_px or len(np.unique(vals)) < 2:
+        return valid, info
+
+    cv2.setRNGSeed(seed)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 80, 0.04)
+    _, labels, _ = cv2.kmeans(
+        vals.reshape(-1, 1).astype(np.float32),
+        2,
+        None,
+        criteria,
+        12,
+        cv2.KMEANS_PP_CENTERS,
+    )
+
+    labels = labels.reshape(-1)
+    ys, xs = np.where(valid)
+    class_map = np.zeros(gray_raw.shape, dtype=np.uint8)
+    class_rows = []
+    for raw_class in (0, 1):
+        class_vals = vals[labels == raw_class]
+        if class_vals.size == 0:
+            return valid, info
+        class_id = raw_class + 1
+        class_map[ys[labels == raw_class], xs[labels == raw_class]] = class_id
+        class_rows.append(
+            {
+                "class_id": class_id,
+                "area_frac": float(class_vals.size / max(1, vals.size)),
+                "raw_median": float(np.median(class_vals)),
+            }
+        )
+
+    delta = abs(class_rows[1]["raw_median"] - class_rows[0]["raw_median"])
+    minority = min(class_rows, key=lambda row: row["area_frac"])
+    info.update(
+        {
+            "boundary_prefilter_delta": float(delta),
+            "boundary_prefilter_removed_frac": float(minority["area_frac"]),
+            "boundary_prefilter_removed_class": int(minority["class_id"]),
+        }
+    )
+    if delta <= max_boundary_delta:
+        return valid, info
+
+    filtered = valid & (class_map != int(minority["class_id"]))
+    if int(filtered.sum()) < min_effective_px:
+        return valid, info
+    info["boundary_prefilter_applied"] = 1
+    return filtered, info
+
+
 def run_binary_kmeans(
     gray_raw: np.ndarray,
     gray_smooth: np.ndarray,
@@ -115,6 +200,7 @@ def run_binary_kmeans(
     trim_high: float,
     min_effective_px: int,
     seed: int,
+    minority_frac_erode_px: int = 0,
 ) -> Optional[dict]:
     valid = inner_mask.copy().astype(bool)
     raw_vals_all = gray_raw[valid].astype(np.float32)
@@ -184,12 +270,31 @@ def run_binary_kmeans(
 
     gray_delta = abs(class_rows[1]["raw_median"] - class_rows[0]["raw_median"])
     smooth_delta = abs(class_rows[1]["smooth_median"] - class_rows[0]["smooth_median"])
-    minority = min(class_rows, key=lambda row: row["area_frac_effective"])
+    minority_before_area_erode = min(class_rows, key=lambda row: row["area_frac_effective"])
+
+    minority_area_mask = erode_mask(valid, minority_frac_erode_px, min_effective_px) & valid
+    minority_area_effective_px = int(minority_area_mask.sum())
+    if minority_area_effective_px <= 0:
+        minority_area_mask = valid
+        minority_area_effective_px = effective_px
+    minority_area_rows = []
+    for class_id in (1, 2):
+        area_px = int(((class_map == class_id) & minority_area_mask).sum())
+        minority_area_rows.append(
+            {
+                "class_id": class_id,
+                "area_px": area_px,
+                "area_frac_effective": float(area_px / max(1, minority_area_effective_px)),
+            }
+        )
+    minority = min(minority_area_rows, key=lambda row: row["area_frac_effective"])
 
     return {
         "class_map": class_map,
         "effective_mask": valid,
+        "minority_area_mask": minority_area_mask,
         "effective_px": effective_px,
+        "minority_area_effective_px": minority_area_effective_px,
         "trim_low_gray": q_low,
         "trim_high_gray": q_high,
         "compactness": float(compactness),
@@ -198,7 +303,11 @@ def run_binary_kmeans(
         "smooth_median_delta": float(smooth_delta),
         "minority_class": int(minority["class_id"]),
         "minority_frac": float(minority["area_frac_effective"]),
+        "minority_class_before_area_erode": int(minority_before_area_erode["class_id"]),
+        "minority_frac_before_area_erode": float(minority_before_area_erode["area_frac_effective"]),
+        "minority_frac_erode_px": int(minority_frac_erode_px),
         "class_rows": class_rows,
+        "minority_area_rows": minority_area_rows,
     }
 
 
@@ -299,14 +408,22 @@ def result_text(label: int, result: Optional[dict], accepted: bool, reason: str)
     rows = result["class_rows"]
     c1 = rows[0]
     c2 = rows[1]
+    prefilter = ""
+    if int(result.get("boundary_prefilter_applied", 0)) == 1:
+        prefilter = (
+            f"\nboundary prefilter: delta={result['boundary_prefilter_delta']:.1f} "
+            f"removed={100.0 * result['boundary_prefilter_removed_frac']:.1f}%"
+        )
     return (
         f"L{label}: {'ACCEPT' if accepted else 'reject'} {reason}\n"
         f"delta={result['gray_median_delta']:.1f} smooth_delta={result['smooth_median_delta']:.1f} "
-        f"minority=C{result['minority_class']} {100.0 * result['minority_frac']:.1f}%\n"
+        f"minority=C{result['minority_class']} {100.0 * result['minority_frac']:.1f}% "
+        f"(pre-erode {100.0 * result['minority_frac_before_area_erode']:.1f}%)\n"
         f"C1 dark: {100.0 * c1['area_frac_effective']:.1f}% med={c1['raw_median']:.1f} "
         f"cc={c1['component_count']} largest={100.0 * c1['largest_component_frac_effective']:.1f}%\n"
         f"C2 bright: {100.0 * c2['area_frac_effective']:.1f}% med={c2['raw_median']:.1f} "
         f"cc={c2['component_count']} largest={100.0 * c2['largest_component_frac_effective']:.1f}%"
+        f"{prefilter}"
     )
 
 
@@ -370,7 +487,28 @@ def main() -> None:
 
         for label in labels:
             sub_mask = final_label == label
-            inner_mask = erode_mask(sub_mask, args.erode_px, args.min_effective_px)
+            if args.disable_boundary_prefilter:
+                boundary_info = {
+                    "boundary_prefilter_applied": 0,
+                    "boundary_prefilter_delta": np.nan,
+                    "boundary_prefilter_removed_frac": 0.0,
+                    "boundary_prefilter_removed_class": "",
+                    "boundary_prefilter_effective_px": int(sub_mask.sum()),
+                }
+                inner_mask = erode_mask(sub_mask, args.erode_px, args.min_effective_px)
+            else:
+                prefiltered_mask, boundary_info = raw_boundary_prefilter(
+                    gray,
+                    sub_mask,
+                    args.boundary_prefilter_delta,
+                    args.min_effective_px,
+                    seed=9301 + raw_id * 97 + infra_id * 13 + label,
+                )
+                inner_mask = (
+                    prefiltered_mask
+                    if int(boundary_info["boundary_prefilter_applied"]) == 1
+                    else erode_mask(prefiltered_mask, args.erode_px, args.min_effective_px)
+                )
             result = run_binary_kmeans(
                 gray,
                 gray_smooth,
@@ -379,7 +517,10 @@ def main() -> None:
                 args.trim_high,
                 args.min_effective_px,
                 seed=1301 + raw_id * 97 + infra_id * 13 + label,
+                minority_frac_erode_px=args.minority_frac_erode_px,
             )
+            if result is not None:
+                result.update(boundary_info)
             accepted, reason = acceptance_reason(
                 result,
                 args.min_gray_delta,
@@ -411,10 +552,18 @@ def main() -> None:
                         "smooth_gray_median_delta": result["smooth_median_delta"],
                         "minority_class": result["minority_class"],
                         "minority_frac": result["minority_frac"],
+                        "minority_class_before_area_erode": result["minority_class_before_area_erode"],
+                        "minority_frac_before_area_erode": result["minority_frac_before_area_erode"],
+                        "minority_area_effective_px": result["minority_area_effective_px"],
+                        "minority_frac_erode_px": result["minority_frac_erode_px"],
                         "effective_px": result["effective_px"],
                         "trim_low_gray": result["trim_low_gray"],
                         "trim_high_gray": result["trim_high_gray"],
                         "compactness_per_px": result["compactness_per_px"],
+                        "boundary_prefilter_applied": result["boundary_prefilter_applied"],
+                        "boundary_prefilter_delta": result["boundary_prefilter_delta"],
+                        "boundary_prefilter_removed_frac": result["boundary_prefilter_removed_frac"],
+                        "boundary_prefilter_removed_class": result["boundary_prefilter_removed_class"],
                         "raw_file": raw_file,
                         "infra_file": infra_file,
                         "raw_id": raw_id,
@@ -444,6 +593,9 @@ def main() -> None:
                             "largest_component_px": class_row["largest_component_px"],
                             "largest_component_frac_of_class": class_row["largest_component_frac_of_class"],
                             "largest_component_frac_effective": class_row["largest_component_frac_effective"],
+                            "boundary_prefilter_applied": result["boundary_prefilter_applied"],
+                            "boundary_prefilter_delta": result["boundary_prefilter_delta"],
+                            "boundary_prefilter_removed_frac": result["boundary_prefilter_removed_frac"],
                             "raw_file": raw_file,
                             "infra_file": infra_file,
                             "decision": row.get("decision", ""),
@@ -460,10 +612,18 @@ def main() -> None:
                         "smooth_gray_median_delta": np.nan,
                         "minority_class": 0,
                         "minority_frac": np.nan,
+                        "minority_class_before_area_erode": 0,
+                        "minority_frac_before_area_erode": np.nan,
+                        "minority_area_effective_px": 0,
+                        "minority_frac_erode_px": args.minority_frac_erode_px,
                         "effective_px": 0,
                         "trim_low_gray": np.nan,
                         "trim_high_gray": np.nan,
                         "compactness_per_px": np.nan,
+                        "boundary_prefilter_applied": boundary_info["boundary_prefilter_applied"],
+                        "boundary_prefilter_delta": boundary_info["boundary_prefilter_delta"],
+                        "boundary_prefilter_removed_frac": boundary_info["boundary_prefilter_removed_frac"],
+                        "boundary_prefilter_removed_class": boundary_info["boundary_prefilter_removed_class"],
                         "raw_file": raw_file,
                         "infra_file": infra_file,
                         "raw_id": raw_id,
@@ -553,7 +713,7 @@ def main() -> None:
     )
     cv2.putText(
         header,
-        f"Default accept rule: raw median gray delta <= {args.max_gray_delta:g}, minority class fraction > {args.min_minority_frac:g}. Green marks accepted minority class.",
+        f"Default accept rule: raw median gray delta <= {args.max_gray_delta:g}, eroded minority fraction > {args.min_minority_frac:g}. Green marks accepted minority class.",
         (8, 50),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.45,
@@ -578,6 +738,10 @@ def main() -> None:
                 "max_gray_delta": args.max_gray_delta,
                 "min_minority_frac": args.min_minority_frac,
                 "min_effective_px": args.min_effective_px,
+                "minority_frac_erode_px": args.minority_frac_erode_px,
+                "boundary_prefilter_delta": args.boundary_prefilter_delta,
+                "disable_boundary_prefilter": args.disable_boundary_prefilter,
+                "boundary_prefilter_rule": "raw k=2 without erode/trim/smoothing; if median delta > threshold, remove minority and skip erode",
                 "accepted_minority_component_gate": "not used",
             },
             f,
