@@ -1,3 +1,0 @@
-sample_index,raw_file,infra_file,raw_annotation_id,accepted_subpart_labels,max_gray_delta,max_minority_frac,figure_file
-1,pair_001_raw_png.rf.736e042afd62ff354ae7635e62e3b44d.jpg,pair_001_infra_png.rf.aab5c8107fca10679e8cd810b894d70f.jpg,70,"1,2",18.0,0.3953488372093023,C:\Users\m1309\Downloads\paper_pipeline_flow_visualization\per_sample\paper_flow_sample_1_pair_001.jpg
-2,pair_006_raw_png.rf.f409c7498bbd90cdae0508f9fcf3d5d9.jpg,pair_006_infra_png.rf.0b99e290142c63bd176e4c5e5d9436ec.jpg,1,"1,2",31.0,0.4180109336708588,C:\Users\m1309\Downloads\paper_pipeline_flow_visualization\per_sample\paper_flow_sample_2_pair_006.jpg

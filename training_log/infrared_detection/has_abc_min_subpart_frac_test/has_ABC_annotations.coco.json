@@ -238,7 +238,7 @@
       ],
       "abc_subpart_count": 2,
       "abc_max_gray_delta": 31.0,
-      "abc_max_minority_frac": 0.4180109336708588
+      "abc_max_minority_frac": 0.38758820336529765
     },
     {
       "id": 2,
@@ -301,7 +301,7 @@
       ],
       "abc_subpart_count": 1,
       "abc_max_gray_delta": 25.0,
-      "abc_max_minority_frac": 0.45130475302889095
+      "abc_max_minority_frac": 0.44449745547073793
     },
     {
       "id": 3,
@@ -365,7 +365,7 @@
       ],
       "abc_subpart_count": 2,
       "abc_max_gray_delta": 21.0,
-      "abc_max_minority_frac": 0.47789084181313596
+      "abc_max_minority_frac": 0.48178790157945633
     },
     {
       "id": 4,
@@ -445,8 +445,8 @@
         1
       ],
       "abc_subpart_count": 1,
-      "abc_max_gray_delta": 16.0,
-      "abc_max_minority_frac": 0.4550115266834119
+      "abc_max_gray_delta": 15.0,
+      "abc_max_minority_frac": 0.4586723945640051
     },
     {
       "id": 5,
@@ -545,7 +545,7 @@
       ],
       "abc_subpart_count": 1,
       "abc_max_gray_delta": 25.0,
-      "abc_max_minority_frac": 0.30348718897419297
+      "abc_max_minority_frac": 0.2644910399915918
     },
     {
       "id": 6,
@@ -606,12 +606,11 @@
       "source_annotation_id": 40,
       "abc_infra_file": "pair_003_infra_png.rf.d1dad70341604e75e9730a67bbc89c6d.jpg",
       "abc_subpart_labels": [
-        3,
-        4
+        1
       ],
-      "abc_subpart_count": 2,
-      "abc_max_gray_delta": 42.0,
-      "abc_max_minority_frac": 0.3762114537444934
+      "abc_subpart_count": 1,
+      "abc_max_gray_delta": 15.0,
+      "abc_max_minority_frac": 0.4743932110853955
     },
     {
       "id": 7,
@@ -667,8 +666,8 @@
         1
       ],
       "abc_subpart_count": 1,
-      "abc_max_gray_delta": 14.0,
-      "abc_max_minority_frac": 0.4394376964240211
+      "abc_max_gray_delta": 15.0,
+      "abc_max_minority_frac": 0.41405592443654726
     },
     {
       "id": 8,
@@ -755,7 +754,7 @@
       ],
       "abc_subpart_count": 1,
       "abc_max_gray_delta": 29.0,
-      "abc_max_minority_frac": 0.4459175424413905
+      "abc_max_minority_frac": 0.44692917445382485
     },
     {
       "id": 9,
@@ -799,7 +798,7 @@
       ],
       "abc_subpart_count": 2,
       "abc_max_gray_delta": 18.0,
-      "abc_max_minority_frac": 0.3953488372093023
+      "abc_max_minority_frac": 0.3293591654247392
     },
     {
       "id": 10,
@@ -857,8 +856,8 @@
         1
       ],
       "abc_subpart_count": 1,
-      "abc_max_gray_delta": 51.0,
-      "abc_max_minority_frac": 0.3461769295402713
+      "abc_max_gray_delta": 37.0,
+      "abc_max_minority_frac": 0.28639273177782365
     }
   ],
   "categories": [

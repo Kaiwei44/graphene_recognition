@@ -2,7 +2,7 @@
   "input_dir": "D:\\Desktop\\infrared\\infrared detection.v2-pair_v2.coco-segmentation\\train",
   "input_annotation": "D:\\Desktop\\infrared\\infrared detection.v2-pair_v2.coco-segmentation\\train\\_annotations.coco.json",
   "segmentation_work_dir": "D:\\PycharmProjects\\graphene_recognition\\training_log\\infrared_detection\\v13_aggressive_raw_canny_gate",
-  "output_coco": "C:\\Users\\m1309\\Downloads\\has_abc_high_gray_overlay_test\\has_ABC_annotations.coco.json",
+  "output_coco": "C:\\Users\\m1309\\Downloads\\has_abc_min_subpart_frac_test\\has_ABC_annotations.coco.json",
   "big_category": "gra",
   "has_abc_category": "has_ABC",
   "abc_params": {
@@ -13,11 +13,15 @@
     "min_gray_delta": 0.0,
     "max_gray_delta": 55.0,
     "min_minority_frac": 0.25,
-    "min_effective_px": 20
+    "min_effective_px": 20,
+    "minority_frac_erode_px": 2,
+    "boundary_prefilter_delta": 80.0,
+    "disable_boundary_prefilter": false
   },
   "assignment_params": {
     "min_subpart_overlap_frac": 0.2,
-    "min_overlap_px": 20
+    "min_overlap_px": 20,
+    "min_subpart_parent_frac": 0.1
   },
   "counts": {
     "subparts_checked": 23,

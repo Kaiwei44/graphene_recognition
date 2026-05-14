@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
     # Attribution from accepted INFRA subpart back to original RAW gra annotation.
     ap.add_argument("--min-subpart-overlap-frac", type=float, default=0.20)
     ap.add_argument("--min-overlap-px", type=int, default=20)
+    ap.add_argument(
+        "--min-subpart-parent-frac",
+        type=float,
+        default=0.10,
+        help="Skip ABC screening when a subpart is smaller than this fraction of its parent graphene area.",
+    )
     return ap.parse_args()
 
 
@@ -401,14 +407,6 @@ def main() -> None:
         pair_subpart_rows: List[dict] = []
 
         for label_id in [int(x) for x in np.unique(final_label) if int(x) > 0]:
-            accepted, reason, result, boundary_info = run_abc_for_subpart(
-                gray,
-                gray_smooth,
-                final_label,
-                label_id,
-                args,
-                seed=1301 + raw_id * 97 + infra_id * 13 + label_id,
-            )
             subpart_mask = final_label == label_id
             assigned_ann_id, overlap_px, overlap_frac = assign_subpart_to_annotation(
                 subpart_mask,
@@ -416,6 +414,33 @@ def main() -> None:
                 args.min_subpart_overlap_frac,
                 args.min_overlap_px,
             )
+            subpart_area_px = int(subpart_mask.sum())
+            parent_graphene_area_px = int(ann_masks[assigned_ann_id].sum()) if assigned_ann_id is not None else 0
+            subpart_parent_area_frac = (
+                float(subpart_area_px / max(1, parent_graphene_area_px))
+                if parent_graphene_area_px > 0
+                else 0.0
+            )
+            boundary_info = {
+                "boundary_prefilter_applied": 0,
+                "boundary_prefilter_delta": np.nan,
+                "boundary_prefilter_removed_frac": 0.0,
+                "boundary_prefilter_removed_class": "",
+                "boundary_prefilter_effective_px": subpart_area_px,
+            }
+            if subpart_parent_area_frac < args.min_subpart_parent_frac:
+                accepted = False
+                reason = "subpart_area_below_graphene_fraction"
+                result = None
+            else:
+                accepted, reason, result, boundary_info = run_abc_for_subpart(
+                    gray,
+                    gray_smooth,
+                    final_label,
+                    label_id,
+                    args,
+                    seed=1301 + raw_id * 97 + infra_id * 13 + label_id,
+                )
 
             summary = {
                 "raw_file": raw_file,
@@ -424,6 +449,9 @@ def main() -> None:
                 "infra_id": infra_id,
                 "raw_annotation_id": assigned_ann_id if assigned_ann_id is not None else "",
                 "subpart_label": label_id,
+                "subpart_area_px": subpart_area_px,
+                "parent_graphene_area_px": parent_graphene_area_px,
+                "subpart_parent_area_frac": subpart_parent_area_frac,
                 "accepted": int(accepted),
                 "reason": reason,
                 "assignment_overlap_px": overlap_px,
@@ -529,6 +557,7 @@ def main() -> None:
                 "assignment_params": {
                     "min_subpart_overlap_frac": args.min_subpart_overlap_frac,
                     "min_overlap_px": args.min_overlap_px,
+                    "min_subpart_parent_frac": args.min_subpart_parent_frac,
                 },
                 "counts": {
                     "subparts_checked": len(subpart_rows),

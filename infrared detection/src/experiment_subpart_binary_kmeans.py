@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
         help="Run raw k=2 KMeans before erode/trim. If raw median delta is above this, remove the minority class as boundary artifact.",
     )
     ap.add_argument("--disable-boundary-prefilter", action="store_true")
+    ap.add_argument(
+        "--min-subpart-graphene-frac",
+        type=float,
+        default=0.10,
+        help="Skip ABC screening when a subpart is smaller than this fraction of the pair graphene mask area.",
+    )
     return ap.parse_args()
 
 
@@ -454,6 +460,7 @@ def main() -> None:
             final_label = cv2.resize(final_label.astype(np.int32), (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
 
         labels = [int(x) for x in np.unique(final_label) if int(x) > 0]
+        graphene_area_px = int((final_label > 0).sum())
         full_class_map = np.zeros_like(gray, dtype=np.uint8)
         accepted_minority_map = np.zeros_like(gray, dtype=np.int32)
         effective_mask_map = np.zeros_like(gray, dtype=np.uint8)
@@ -487,46 +494,60 @@ def main() -> None:
 
         for label in labels:
             sub_mask = final_label == label
-            if args.disable_boundary_prefilter:
+            subpart_area_px = int(sub_mask.sum())
+            subpart_graphene_area_frac = float(subpart_area_px / max(1, graphene_area_px))
+            if subpart_graphene_area_frac < args.min_subpart_graphene_frac:
                 boundary_info = {
                     "boundary_prefilter_applied": 0,
                     "boundary_prefilter_delta": np.nan,
                     "boundary_prefilter_removed_frac": 0.0,
                     "boundary_prefilter_removed_class": "",
-                    "boundary_prefilter_effective_px": int(sub_mask.sum()),
+                    "boundary_prefilter_effective_px": subpart_area_px,
                 }
-                inner_mask = erode_mask(sub_mask, args.erode_px, args.min_effective_px)
+                result = None
+                accepted = False
+                reason = "subpart_area_below_graphene_fraction"
             else:
-                prefiltered_mask, boundary_info = raw_boundary_prefilter(
+                if args.disable_boundary_prefilter:
+                    boundary_info = {
+                        "boundary_prefilter_applied": 0,
+                        "boundary_prefilter_delta": np.nan,
+                        "boundary_prefilter_removed_frac": 0.0,
+                        "boundary_prefilter_removed_class": "",
+                        "boundary_prefilter_effective_px": int(sub_mask.sum()),
+                    }
+                    inner_mask = erode_mask(sub_mask, args.erode_px, args.min_effective_px)
+                else:
+                    prefiltered_mask, boundary_info = raw_boundary_prefilter(
+                        gray,
+                        sub_mask,
+                        args.boundary_prefilter_delta,
+                        args.min_effective_px,
+                        seed=9301 + raw_id * 97 + infra_id * 13 + label,
+                    )
+                    inner_mask = (
+                        prefiltered_mask
+                        if int(boundary_info["boundary_prefilter_applied"]) == 1
+                        else erode_mask(prefiltered_mask, args.erode_px, args.min_effective_px)
+                    )
+                result = run_binary_kmeans(
                     gray,
-                    sub_mask,
-                    args.boundary_prefilter_delta,
+                    gray_smooth,
+                    inner_mask,
+                    args.trim_low,
+                    args.trim_high,
                     args.min_effective_px,
-                    seed=9301 + raw_id * 97 + infra_id * 13 + label,
+                    seed=1301 + raw_id * 97 + infra_id * 13 + label,
+                    minority_frac_erode_px=args.minority_frac_erode_px,
                 )
-                inner_mask = (
-                    prefiltered_mask
-                    if int(boundary_info["boundary_prefilter_applied"]) == 1
-                    else erode_mask(prefiltered_mask, args.erode_px, args.min_effective_px)
+                if result is not None:
+                    result.update(boundary_info)
+                accepted, reason = acceptance_reason(
+                    result,
+                    args.min_gray_delta,
+                    args.max_gray_delta,
+                    args.min_minority_frac,
                 )
-            result = run_binary_kmeans(
-                gray,
-                gray_smooth,
-                inner_mask,
-                args.trim_low,
-                args.trim_high,
-                args.min_effective_px,
-                seed=1301 + raw_id * 97 + infra_id * 13 + label,
-                minority_frac_erode_px=args.minority_frac_erode_px,
-            )
-            if result is not None:
-                result.update(boundary_info)
-            accepted, reason = acceptance_reason(
-                result,
-                args.min_gray_delta,
-                args.max_gray_delta,
-                args.min_minority_frac,
-            )
 
             if result is not None:
                 class_map = result["class_map"]
@@ -546,6 +567,9 @@ def main() -> None:
                     {
                         "pair": pair,
                         "subpart_label": label,
+                        "subpart_area_px": subpart_area_px,
+                        "graphene_area_px": graphene_area_px,
+                        "subpart_graphene_area_frac": subpart_graphene_area_frac,
                         "accepted": int(accepted),
                         "reason": reason,
                         "raw_gray_median_delta": result["gray_median_delta"],
@@ -577,6 +601,9 @@ def main() -> None:
                         {
                             "pair": pair,
                             "subpart_label": label,
+                            "subpart_area_px": subpart_area_px,
+                            "graphene_area_px": graphene_area_px,
+                            "subpart_graphene_area_frac": subpart_graphene_area_frac,
                             "accepted": int(accepted),
                             "reason": reason,
                             "class_id_dark_to_bright": class_row["class_id"],
@@ -606,6 +633,9 @@ def main() -> None:
                     {
                         "pair": pair,
                         "subpart_label": label,
+                        "subpart_area_px": subpart_area_px,
+                        "graphene_area_px": graphene_area_px,
+                        "subpart_graphene_area_frac": subpart_graphene_area_frac,
                         "accepted": 0,
                         "reason": reason,
                         "raw_gray_median_delta": np.nan,
@@ -739,6 +769,7 @@ def main() -> None:
                 "min_minority_frac": args.min_minority_frac,
                 "min_effective_px": args.min_effective_px,
                 "minority_frac_erode_px": args.minority_frac_erode_px,
+                "min_subpart_graphene_frac": args.min_subpart_graphene_frac,
                 "boundary_prefilter_delta": args.boundary_prefilter_delta,
                 "disable_boundary_prefilter": args.disable_boundary_prefilter,
                 "boundary_prefilter_rule": "raw k=2 without erode/trim/smoothing; if median delta > threshold, remove minority and skip erode",
