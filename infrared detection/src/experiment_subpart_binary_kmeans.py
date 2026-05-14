@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         help="Output folder for CSVs and visualizations.",
     )
     ap.add_argument("--erode-px", type=int, default=2)
-    ap.add_argument("--trim-low", type=float, default=5.0)
+    ap.add_argument("--trim-low", type=float, default=10.0)
     ap.add_argument("--trim-high", type=float, default=95.0)
     ap.add_argument("--gaussian-sigma", type=float, default=0.5)
     ap.add_argument("--max-gray-delta", type=float, default=55.0)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end non-DL raw/infra selective hybrid pipeline with conservative infra coarsening.
+"""Compact non-DL raw/infra subpart pipeline.
 
 Pipeline assumption:
 - Upstream model gives large-block masks (category 'gra') on RAW images only.
@@ -9,9 +9,9 @@ Pipeline assumption:
 Main steps:
 1. Split each raw large block into subparts with v3 raw graph-superpixel baseline.
 2. Estimate raw->infra registration using raw gra mask and an automatically detected infra foreground mask.
-3. Warp raw subparts to infra coordinates. This is the default final result.
-4. Generate an infra-only candidate in the inferred infra gra region.
-5. Selectively switch to infra candidate only when an infra-domain score and complexity checks say raw is likely unreliable.
+3. Warp raw subparts to infra coordinates. This raw-warp result is the default seed.
+4. Build a small set of final candidates: merge-to-one, raw+infra hybrid, and raw multi-channel Canny.
+5. Use conservative gates and unsupervised scores to select the final result.
 6. If infra manual subparts exist in COCO, evaluate final masks against infra subparts.
 
 This script intentionally does not use deep learning. It also does not use infra gra/subpart annotations for inference;
@@ -20,7 +20,6 @@ those are used only when --eval is set.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import shutil
@@ -37,7 +36,7 @@ from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
 from scipy.optimize import linear_sum_assignment
 from skimage.filters import threshold_multiotsu
-from skimage.segmentation import felzenszwalb, find_boundaries, watershed
+from skimage.segmentation import felzenszwalb, find_boundaries
 from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score
 
@@ -105,8 +104,6 @@ def parse_args():
     ap.add_argument('--eval', action='store_true', help='Evaluate against infra subparts if available. Evaluation annotations are never used for inference.')
     ap.add_argument('--overview-width', type=int, default=1350)
     ap.add_argument('--skip-overview', action='store_true', help='Do not save JPG panels/contact sheet; useful for fast batch validation.')
-    ap.add_argument('--coarsen-infra-output', action='store_true', default=True, help='When selective logic chooses infra, coarsen the infra candidate before output to suppress texture/stacking-induced fragments.')
-    ap.add_argument('--no-coarsen-infra-output', dest='coarsen_infra_output', action='store_false')
     return ap.parse_args()
 
 def prepare_dataset(args):
@@ -451,19 +448,6 @@ def score_segmentation_in_infra(rgb:np.ndarray, label:np.ndarray, mask:np.ndarra
     count_pen=0.045*max(0,len(labs)-2)
     return within - 0.04*bgrad + small_pen + count_pen
 
-def selective_decision(raw_score:float, cand_score:float, raw_regions:int, cand_regions:int, reg_iou:float, auto_cost:float=0.0)->str:
-    # Conservative switching. Two cases trigger infra:
-    # 1) raw predicts very few regions while infra has much lower energy;
-    # 2) registration/shape matching was hard (high auto_cost), suggesting a complex block,
-    #    and infra proposes substantially more structure.
-    if raw_regions <= 2 and cand_regions > raw_regions and cand_score < raw_score - 0.25:
-        return 'use_infra'
-    if auto_cost > 0.18 and cand_regions >= raw_regions + 4:
-        return 'use_infra'
-    return 'keep_raw'
-
-
-
 def pair_by_filename(raws,infras):
     import re
     raw_by={}; infra_by={}
@@ -503,15 +487,7 @@ def adjacent_label_pairs(label: np.ndarray, inside: np.ndarray) -> set[tuple[int
     return pairs
 
 def coarsen_candidate_by_adjacency(label: np.ndarray, mask: np.ndarray, target_regions: Optional[int] = None) -> np.ndarray:
-    """Reduce infra over-segmentation by merging the smallest adjacent regions.
-
-    This is intentionally intensity-agnostic. The high-sensitivity infra candidate is still
-    used as an evidence map for deciding whether the block should be handled by infra, but
-    the output mask is coarsened so stacking/texture stripes are less likely to appear as
-    separate thickness subparts.
-
-    Default target is ceil(K/2), where K is the candidate region count.
-    """
+    """Merge smallest adjacent evidence regions until the target count is reached."""
     inside = mask > 0
     lab = relabel(label.copy())
     k = int(lab.max())
@@ -611,202 +587,6 @@ def raw_evidence_channels_in_infra(raw_rgb: np.ndarray, raw_mask: np.ndarray, M:
     }
     return {name: warp_float(ch, M, out_shape) for name, ch in chans.items()}
 
-def robust_range(ch: np.ndarray, inside: np.ndarray) -> float:
-    vals = ch[inside]
-    if len(vals) < 10:
-        return 1.0
-    q10, q90 = np.percentile(vals, [10, 90])
-    return max(1.0, float(q90 - q10))
-
-def normalized_gradient_max(channels: Dict[str, np.ndarray], inside: np.ndarray) -> np.ndarray:
-    out = np.zeros_like(next(iter(channels.values())), np.float32)
-    for ch in channels.values():
-        gx = cv2.Sobel(ch.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(ch.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
-        g = cv2.magnitude(gx, gy)
-        denom = float(np.percentile(g[inside], 75)) if inside.sum() else 1.0
-        out = np.maximum(out, g / max(1.0, denom))
-    return out
-
-def pair_boundary_pixels(label: np.ndarray, inside: np.ndarray) -> Dict[Tuple[int, int], List[Tuple[int, int, int, int]]]:
-    pairs: Dict[Tuple[int, int], List[Tuple[int, int, int, int]]] = {}
-    a = label[:, :-1]; b = label[:, 1:]
-    m = (a != b) & (a > 0) & (b > 0) & inside[:, :-1] & inside[:, 1:]
-    ys, xs = np.nonzero(m)
-    for y, x in zip(ys, xs):
-        p = tuple(sorted((int(label[y, x]), int(label[y, x + 1]))))
-        pairs.setdefault(p, []).append((int(y), int(x), int(y), int(x + 1)))
-    a = label[:-1, :]; b = label[1:, :]
-    m = (a != b) & (a > 0) & (b > 0) & inside[:-1, :] & inside[1:, :]
-    ys, xs = np.nonzero(m)
-    for y, x in zip(ys, xs):
-        p = tuple(sorted((int(label[y, x]), int(label[y + 1, x]))))
-        pairs.setdefault(p, []).append((int(y), int(x), int(y + 1), int(x)))
-    return pairs
-
-def split_label_parents(split_label: np.ndarray, raw_label: np.ndarray, inside: np.ndarray) -> Dict[int, int]:
-    parents: Dict[int, int] = {}
-    for lab in [int(x) for x in np.unique(split_label[inside]) if x > 0]:
-        vals = raw_label[(split_label == lab) & inside]
-        vals = vals[vals > 0]
-        if len(vals) == 0:
-            parents[lab] = 0
-            continue
-        labs, counts = np.unique(vals, return_counts=True)
-        parents[lab] = int(labs[int(np.argmax(counts))])
-    return parents
-
-def boundary_support_stats(
-    label: np.ndarray,
-    a: int,
-    b: int,
-    edge_pts: Sequence[Tuple[int, int, int, int]],
-    inside: np.ndarray,
-    raw_channels: Dict[str, np.ndarray],
-    raw_grad_max: np.ndarray,
-    infra_grad_norm: np.ndarray,
-    band_radius: int = 5,
-) -> Dict[str, float]:
-    edge = np.zeros_like(label, np.uint8)
-    y1 = np.array([p[0] for p in edge_pts], dtype=np.int32)
-    x1 = np.array([p[1] for p in edge_pts], dtype=np.int32)
-    y2 = np.array([p[2] for p in edge_pts], dtype=np.int32)
-    x2 = np.array([p[3] for p in edge_pts], dtype=np.int32)
-    edge[y1, x1] = 1
-    edge[y2, x2] = 1
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_radius + 1, 2 * band_radius + 1))
-    band = (cv2.dilate(edge, k, iterations=1) > 0) & inside
-    side_a = band & (label == a)
-    side_b = band & (label == b)
-    if side_a.sum() < 8 or side_b.sum() < 8:
-        return dict(valid=0, edge_count=float(len(edge_pts)))
-    side_max = 0.0
-    for ch in raw_channels.values():
-        rr = robust_range(ch, inside)
-        side = abs(float(np.median(ch[side_a])) - float(np.median(ch[side_b]))) / rr
-        side_max = max(side_max, side)
-    edge_ys = np.r_[y1, y2]
-    edge_xs = np.r_[x1, x2]
-    raw_grad = float(np.median(raw_grad_max[edge_ys, edge_xs]))
-    infra_grad = float(np.median(infra_grad_norm[edge_ys, edge_xs]))
-    support = side_max + 0.05 * min(4.0, max(0.0, raw_grad - 1.0))
-    area_a = int(((label == a) & inside).sum())
-    area_b = int(((label == b) & inside).sum())
-    return dict(valid=1, edge_count=float(len(edge_pts)), side=float(side_max), raw_grad=raw_grad, infra_grad=infra_grad, support=support, area_a=float(area_a), area_b=float(area_b))
-
-def raw_supported_split_boundary(stats: Dict[str, float], total_area: int) -> bool:
-    if not stats.get('valid', 0):
-        return False
-    min_area = max(25.0, 0.006 * float(total_area))
-    if min(stats.get('area_a', 0.0), stats.get('area_b', 0.0)) < min_area:
-        return False
-    if stats['edge_count'] < 21:
-        return False
-    weak_raw = stats['side'] >= 0.17 and stats['raw_grad'] >= 1.26
-    medium_raw = stats['edge_count'] >= 38 and stats['side'] >= 0.23 and stats['support'] >= 0.29
-    infra_supported = stats['infra_grad'] >= 1.30
-    return bool(medium_raw or (weak_raw and infra_supported))
-
-def raw_led_refine_candidate(
-    infra_rgb: np.ndarray,
-    raw_label: np.ndarray,
-    raw_channels: Dict[str, np.ndarray],
-    mask: np.ndarray,
-    evidence: np.ndarray,
-) -> np.ndarray:
-    """Split raw regions only where infra proposes a boundary and RAW has calibrated support."""
-    inside = mask > 0
-    raw = relabel(fill_zero_inside(raw_label, inside)) if raw_label.max() > 0 else raw_label
-    if raw.max() <= 0:
-        out = np.zeros_like(raw, np.int32)
-        out[inside] = 1
-        return out
-    split = intersect_label_maps(raw, evidence, mask, min_area_fraction=0.006)
-    split = relabel(fill_zero_inside(split, inside))
-    raw_grad_max = normalized_gradient_max(raw_channels, inside)
-    I = corrected_infra_intensity(infra_rgb, mask)
-    gx = cv2.Sobel(I.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(I.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
-    infra_grad = cv2.magnitude(gx, gy)
-    denom = float(np.percentile(infra_grad[inside], 75)) if inside.sum() else 1.0
-    infra_grad_norm = infra_grad / max(1.0, denom)
-    total_area = int(inside.sum())
-
-    for _ in range(80):
-        parents = split_label_parents(split, raw, inside)
-        pairs = pair_boundary_pixels(split, inside)
-        unsupported: List[Tuple[float, int, int]] = []
-        for (a, b), pts in pairs.items():
-            if parents.get(a, 0) != parents.get(b, -1):
-                continue
-            stats = boundary_support_stats(split, a, b, pts, inside, raw_channels, raw_grad_max, infra_grad_norm)
-            if not raw_supported_split_boundary(stats, total_area):
-                priority = stats.get('support', 0.0) + 0.02 * stats.get('edge_count', 0.0) / max(1.0, math.sqrt(total_area))
-                unsupported.append((priority, a, b))
-        if not unsupported:
-            break
-        _, a, b = min(unsupported, key=lambda x: x[0])
-        area_a = int(((split == a) & inside).sum())
-        area_b = int(((split == b) & inside).sum())
-        src, dst = (a, b) if area_a <= area_b else (b, a)
-        split[split == src] = dst
-        split = relabel(split)
-    return relabel(fill_zero_inside(split, inside))
-
-def raw_led_weakmerge_candidate(
-    infra_rgb: np.ndarray,
-    label: np.ndarray,
-    raw_channels: Dict[str, np.ndarray],
-    mask: np.ndarray,
-    max_merges: int = 20,
-) -> Tuple[np.ndarray, int]:
-    """Merge weak raw-led boundaries that are unsupported by both RAW and INFRA evidence."""
-    inside = mask > 0
-    lab = relabel(fill_zero_inside(label, inside)) if label.max() > 0 else label.copy()
-    if lab.max() <= 1 or inside.sum() < 50:
-        return lab, 0
-
-    raw_grad_max = normalized_gradient_max(raw_channels, inside)
-    I = corrected_infra_intensity(infra_rgb, mask)
-    gx = cv2.Sobel(I.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(I.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
-    infra_grad = cv2.magnitude(gx, gy)
-    denom = float(np.percentile(infra_grad[inside], 75)) if inside.sum() else 1.0
-    infra_grad_norm = infra_grad / max(1.0, denom)
-    intensity_range = float(np.percentile(I[inside], 90) - np.percentile(I[inside], 10)) + 1e-6
-    merges = 0
-
-    for _ in range(max_merges):
-        merge_candidates: List[Tuple[float, int, int]] = []
-        for (a, b), pts in pair_boundary_pixels(lab, inside).items():
-            stats = boundary_support_stats(lab, a, b, pts, inside, raw_channels, raw_grad_max, infra_grad_norm)
-            if not stats.get('valid', 0):
-                continue
-            side_a = (lab == a) & inside
-            side_b = (lab == b) & inside
-            infra_side_diff = abs(float(np.median(I[side_a])) - float(np.median(I[side_b]))) / intensity_range
-            weak_same = stats['edge_count'] >= 45 and stats['side'] < 0.12 and infra_side_diff < 0.12
-            weak_raw_parent = (
-                stats['edge_count'] >= 80
-                and stats['support'] < 0.29
-                and stats['infra_grad'] < 0.85
-                and infra_side_diff < 0.28
-            )
-            if weak_same or weak_raw_parent:
-                priority = stats['support'] + 0.5 * infra_side_diff + 0.04 * stats['infra_grad']
-                merge_candidates.append((priority, a, b))
-        if not merge_candidates:
-            break
-        _, a, b = min(merge_candidates, key=lambda x: x[0])
-        area_a = int(((lab == a) & inside).sum())
-        area_b = int(((lab == b) & inside).sum())
-        src, dst = (a, b) if area_a <= area_b else (b, a)
-        lab[lab == src] = dst
-        lab = relabel(lab)
-        merges += 1
-
-    return relabel(fill_zero_inside(lab, inside)), merges
-
 RAW_CANNY_CHANNELS = ("gray", "Lcorr", "R", "G", "B")
 RAW_CANNY_SCORE_CHANNELS = ("gray", "Lcorr", "G", "B")
 
@@ -849,8 +629,6 @@ def raw_canny_combo_edges(edge_maps: Dict[str, np.ndarray], combo: str) -> np.nd
         return stack_all.sum(axis=0) >= 3
     if combo == "Lcorr":
         return edge_maps["Lcorr"]
-    if combo == "all_union":
-        return stack_all.any(axis=0)
     if combo == "recall_then_clean":
         high_recall = stack_all.any(axis=0)
         clean_support = cv2.dilate(stack_clean.any(axis=0).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(bool)
@@ -924,7 +702,6 @@ def build_raw_canny_candidates(raw_channels: Dict[str, np.ndarray], mask: np.nda
     configs = {
         "raw_canny_vote3": ("all_vote3", 0.33, 1),
         "raw_canny_lcorr_closed": ("Lcorr", 0.20, 2),
-        "raw_canny_union_closed": ("all_union", 0.20, 1),
         "raw_canny_recall_clean": ("recall_then_clean", 0.50, 1),
     }
     edge_cache: Dict[float, Dict[str, np.ndarray]] = {}
@@ -969,7 +746,7 @@ def select_raw_canny_candidate(
             if ok:
                 passing.append(("raw_canny_vote3", cand))
     elif raw_regions >= 4:
-        for name in ("raw_canny_lcorr_closed", "raw_canny_union_closed", "raw_canny_recall_clean"):
+        for name in ("raw_canny_lcorr_closed", "raw_canny_recall_clean"):
             cand = candidates.get(name)
             if not cand:
                 continue
@@ -986,70 +763,12 @@ def select_raw_canny_candidate(
     best_name, best = min(passing, key=lambda item: item[1]["raw_channel_score"])
     return best_name, best["label"], current_score, best["raw_channel_score"], f"{best_name}_raw_channel_score_improved"
 
-def eroded_seed_markers(label: np.ndarray, inside: np.ndarray) -> np.ndarray:
-    markers = np.zeros_like(label, np.int32)
-    for lab in [int(x) for x in np.unique(label[inside]) if x > 0]:
-        m = (label == lab) & inside
-        area = int(m.sum())
-        if area == 0:
-            continue
-        radius = max(1, int(round(math.sqrt(area) / 80.0)))
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
-        core = cv2.erode(m.astype(np.uint8), k, iterations=1).astype(bool)
-        if core.sum() < max(8, 0.03 * area):
-            dist = distance_transform_edt(m)
-            core = dist >= max(1.0, float(np.percentile(dist[m], 65)))
-        if core.sum() == 0:
-            core = m
-        markers[core] = lab
-    return markers
-
-def normalized_gradient(ch: np.ndarray, inside: np.ndarray) -> np.ndarray:
-    gx = cv2.Sobel(ch.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(ch.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
-    g = cv2.magnitude(gx, gy)
-    denom = float(np.percentile(g[inside], 75)) if inside.sum() else 1.0
-    return g / max(1.0, denom)
-
-def mean_shift_watershed_candidate(
-    raw_rgb: np.ndarray,
-    infra_rgb: np.ndarray,
-    marker_label: np.ndarray,
-    raw_mask: np.ndarray,
-    infra_mask: np.ndarray,
-    M: np.ndarray,
-    sp: int = 12,
-    sr: int = 18,
-) -> np.ndarray:
-    """Refine marker boundaries with raw mean-shift smoothing and seeded watershed."""
-    inside = infra_mask > 0
-    markers_src = relabel(fill_zero_inside(marker_label, inside)) if marker_label.max() > 0 else marker_label
-    if markers_src.max() <= 1 or inside.sum() < 100:
-        return markers_src
-    raw_ms = cv2.pyrMeanShiftFiltering(raw_rgb, sp=sp, sr=sr, maxLevel=1)
-    raw_ms_channels = raw_evidence_channels_in_infra(raw_ms, raw_mask, M, infra_rgb.shape[:2])
-    raw_grad = normalized_gradient_max(raw_ms_channels, inside)
-    infra_I = corrected_infra_intensity(infra_rgb, infra_mask)
-    infra_grad = normalized_gradient(infra_I, inside)
-    elevation = 0.72 * raw_grad + 0.28 * infra_grad
-    elevation = cv2.GaussianBlur(elevation.astype(np.float32), (0, 0), sigmaX=0.7, sigmaY=0.7)
-    elevation[~inside] = float(elevation[inside].max() if inside.any() else 0.0)
-    markers = eroded_seed_markers(markers_src, inside)
-    if markers.max() <= 1:
-        return markers_src
-    ws = watershed(elevation, markers=markers, mask=inside, watershed_line=False).astype(np.int32)
-    ws = relabel(fill_zero_inside(ws, inside))
-    return ws
-
 def selective_decision_v3_fast(raw_score:float, cand_score:float, raw_regions:int, cand_regions:int, cand_bgrad:float)->str:
     # Merge-to-one anti-oversegmentation first: raw split the block, but infra boundaries are weak
     # and raw's infra-domain energy is already low. This prevents homogeneous infra blocks
     # from being overcut by either raw color noise or infra quantization.
     if raw_regions >= 3 and raw_score < 1.0 and cand_bgrad < 1.8:
         return 'merge_to_one'
-    # Use infra when raw is low-confidence and infra has either much lower energy or strong supported boundaries.
-    if cand_regions >= raw_regions + 3 and (cand_bgrad > 2.0 or cand_score < raw_score - 0.25):
-        return 'use_infra'
     return 'keep_raw'
 
 # ---------------- Visualization ----------------
@@ -1184,23 +903,11 @@ def main():
         infra_candidate=infra_kmeans_candidate(infra_rgb,inferred_gra)
         infra_candidate[~(inferred_gra>0)]=0
         infra_candidate=relabel(fill_zero_inside(infra_candidate,inferred_gra>0)) if infra_candidate.max()>0 else infra_candidate
-        # Keep the default infra candidate for normal decisions, and keep higher-sensitivity
-        # coarse variants as diagnostics/candidates without letting them directly override final.
-        infra_candidate_coarse = coarsen_candidate_by_adjacency(infra_candidate, inferred_gra) if args.coarsen_infra_output else infra_candidate
-        infra_highsens_candidate = infra_quantile_candidate(infra_rgb, inferred_gra, k=10, min_area_fraction=0.01)
-        infra_coarse_t2 = coarsen_candidate_by_adjacency(infra_highsens_candidate, inferred_gra, target_regions=2)
-        infra_coarse_t3 = coarsen_candidate_by_adjacency(infra_highsens_candidate, inferred_gra, target_regions=3)
-        infra_coarse_t4 = coarsen_candidate_by_adjacency(infra_highsens_candidate, inferred_gra, target_regions=4)
         one_label=np.zeros_like(raw_warp_label,np.int32); one_label[inferred_gra>0]=1
         raw_score=score_segmentation_in_infra(infra_rgb,raw_warp_label,inferred_gra)
         cand_score=score_segmentation_in_infra(infra_rgb,infra_candidate,inferred_gra)
         raw_regions=int(raw_warp_label.max()); cand_regions=int(infra_candidate.max())
         cand_bgrad=boundary_gradient_support(infra_rgb,infra_candidate,inferred_gra)
-        infra_highsens_regions=int(infra_highsens_candidate.max())
-        infra_highsens_score=score_segmentation_in_infra(infra_rgb,infra_highsens_candidate,inferred_gra)
-        infra_t2_score=score_segmentation_in_infra(infra_rgb,infra_coarse_t2,inferred_gra)
-        infra_t3_score=score_segmentation_in_infra(infra_rgb,infra_coarse_t3,inferred_gra)
-        infra_t4_score=score_segmentation_in_infra(infra_rgb,infra_coarse_t4,inferred_gra)
         decision=selective_decision_v3_fast(raw_score,cand_score,raw_regions,cand_regions,cand_bgrad)
         infra_q4_evidence=infra_quantile_candidate(infra_rgb,inferred_gra,k=4)
         hybrid_q4=hybrid_raw_infra_candidate(infra_rgb,raw_warp_label,inferred_gra,infra_q4_evidence)
@@ -1219,60 +926,10 @@ def main():
         raw_canny_info=build_raw_canny_candidates(raw_channels_infra,inferred_gra)
         raw_canny_vote3=raw_canny_info["raw_canny_vote3"]["label"]
         raw_canny_lcorr_closed=raw_canny_info["raw_canny_lcorr_closed"]["label"]
-        raw_canny_union_closed=raw_canny_info["raw_canny_union_closed"]["label"]
         raw_canny_recall_clean=raw_canny_info["raw_canny_recall_clean"]["label"]
-        raw_led_q4=raw_led_refine_candidate(infra_rgb,raw_warp_label,raw_channels_infra,inferred_gra,infra_q4_evidence)
-        raw_led_candidate=raw_led_refine_candidate(infra_rgb,raw_warp_label,raw_channels_infra,inferred_gra,infra_candidate)
-        raw_led_q4_score=score_segmentation_in_infra(infra_rgb,raw_led_q4,inferred_gra)
-        raw_led_candidate_score=score_segmentation_in_infra(infra_rgb,raw_led_candidate,inferred_gra)
-        if raw_led_candidate_score < raw_led_q4_score:
-            raw_led_refined=raw_led_candidate
-            raw_led_score=raw_led_candidate_score
-            raw_led_source='infra_candidate'
-        else:
-            raw_led_refined=raw_led_q4
-            raw_led_score=raw_led_q4_score
-            raw_led_source='infra_q4'
-        raw_led_regions=int(raw_led_refined.max())
-        raw_led_weakmerge, raw_led_weakmerge_merges = raw_led_weakmerge_candidate(infra_rgb, raw_led_refined, raw_channels_infra, inferred_gra)
-        raw_led_weakmerge_regions=int(raw_led_weakmerge.max())
-        raw_led_weakmerge_score=score_segmentation_in_infra(infra_rgb,raw_led_weakmerge,inferred_gra)
-        watershed_raw=mean_shift_watershed_candidate(raw_rgb,infra_rgb,raw_warp_label,raw_gra_union,inferred_gra,M)
-        watershed_raw_led=mean_shift_watershed_candidate(raw_rgb,infra_rgb,raw_led_refined,raw_gra_union,inferred_gra,M)
-        watershed_raw_score=score_segmentation_in_infra(infra_rgb,watershed_raw,inferred_gra)
-        watershed_raw_led_score=score_segmentation_in_infra(infra_rgb,watershed_raw_led,inferred_gra)
-        if watershed_raw_led_score < watershed_raw_score:
-            mean_shift_watershed=watershed_raw_led
-            watershed_score=watershed_raw_led_score
-            watershed_source='raw_led_seed'
-        else:
-            mean_shift_watershed=watershed_raw
-            watershed_score=watershed_raw_score
-            watershed_source='raw_seed'
-        watershed_regions=int(mean_shift_watershed.max())
-        raw_led_improves=(raw_led_regions > raw_regions and raw_led_regions <= max(raw_regions + 5, raw_regions * 2) and raw_led_score < raw_score - 0.08)
-        raw_led_conservative_split=(raw_regions >= 5 and raw_led_regions > raw_regions and raw_led_regions <= raw_regions + 3 and cand_regions >= raw_regions + 3 and cand_bgrad < 1.8 and raw_led_score < raw_score + 0.25)
-        watershed_improves=(watershed_regions >= raw_regions and watershed_regions <= max(raw_regions + 5, raw_regions * 2) and watershed_score < raw_score - 0.10 and watershed_score <= raw_led_score + 0.05)
-        raw_led_split_ok=raw_regions > 2 and (raw_led_improves or raw_led_conservative_split)
-        watershed_refines_raw_led=(raw_led_split_ok and int(watershed_raw_led.max()) == raw_led_regions and watershed_raw_led_score <= raw_led_score + 0.05)
         if decision=='merge_to_one':
             final_reason='merge_to_one_low_raw_score_weak_infra_boundary'
             final=one_label
-        elif watershed_refines_raw_led:
-            decision='mean_shift_watershed'
-            final_reason='watershed_refines_raw_led'
-            final=watershed_raw_led
-        elif raw_led_split_ok:
-            decision='raw_split_refined'
-            final_reason='raw_led_supported_split'
-            final=raw_led_refined
-        elif raw_regions > 2 and watershed_improves:
-            decision='mean_shift_watershed'
-            final_reason='watershed_improves_raw'
-            final=mean_shift_watershed
-        elif decision=='use_infra':
-            final_reason='use_infra_selective_decision'
-            final=infra_candidate_coarse
         elif raw_regions == 2 and cand_regions >= 5 and cand_bgrad < 1.8 and hybrid_score < raw_score - 0.05:
             decision='hybrid_raw_infra'
             final_reason='hybrid_improves_two_region_raw'
@@ -1280,17 +937,6 @@ def main():
         else:
             final_reason='keep_raw'
             final=raw_warp_label
-        weakmerge_ok=(
-            decision in ('mean_shift_watershed','raw_split_refined')
-            and raw_led_regions > raw_regions
-            and raw_led_weakmerge_regions <= raw_led_regions - 2
-            and raw_regions - 1 <= raw_led_weakmerge_regions <= raw_regions + 1
-            and raw_led_weakmerge_score <= min(raw_score, watershed_score) - 0.05
-        )
-        if weakmerge_ok:
-            decision='raw_led_weakmerge'
-            final_reason='weak_boundary_merge_after_raw_led'
-            final=raw_led_weakmerge
         raw_canny_selected, raw_canny_selected_label, final_raw_channel_score, raw_canny_selected_score, raw_canny_final_reason = select_raw_canny_candidate(
             decision, raw_regions, final, raw_channels_infra, inferred_gra, raw_canny_info
         )
@@ -1314,7 +960,7 @@ def main():
             raw_canny_pair_fields[f'{canny_name}_regions'] = canny_data['regions']
             raw_canny_pair_fields[f'{canny_name}_raw_channel_score'] = canny_data['raw_channel_score']
             raw_canny_pair_fields[f'{canny_name}_edge_support'] = canny_data['edge_support']
-        pair_row=dict(raw_file=raw_fn,infra_file=infra_fn,raw_id=raw_im['id'],infra_id=infra_im['id'],auto_mask_cost=auto_cost,auto_mask_iou=auto_iou,reg_iou=reg_iou,decision=decision,final_reason=final_reason,raw_regions=raw_regions,infra_candidate_regions=cand_regions,infra_highsens_regions=infra_highsens_regions,infra_t2_regions=int(infra_coarse_t2.max()),infra_t3_regions=int(infra_coarse_t3.max()),infra_t4_regions=int(infra_coarse_t4.max()),hybrid_regions=int(hybrid_raw_infra.max()),hybrid_source=hybrid_source,raw_led_regions=raw_led_regions,raw_led_source=raw_led_source,raw_led_weakmerge_regions=raw_led_weakmerge_regions,raw_led_weakmerge_merges=raw_led_weakmerge_merges,watershed_regions=watershed_regions,watershed_source=watershed_source,raw_score=raw_score,infra_score=cand_score,infra_highsens_score=infra_highsens_score,infra_t2_score=infra_t2_score,infra_t3_score=infra_t3_score,infra_t4_score=infra_t4_score,hybrid_score=hybrid_score,raw_led_score=raw_led_score,raw_led_weakmerge_score=raw_led_weakmerge_score,watershed_score=watershed_score,watershed_raw_score=watershed_raw_score,watershed_raw_led_score=watershed_raw_led_score,hybrid_q4_score=hybrid_q4_score,hybrid_candidate_score=hybrid_candidate_score,raw_led_q4_score=raw_led_q4_score,raw_led_candidate_score=raw_led_candidate_score,infra_bgrad=cand_bgrad)
+        pair_row=dict(raw_file=raw_fn,infra_file=infra_fn,raw_id=raw_im['id'],infra_id=infra_im['id'],auto_mask_cost=auto_cost,auto_mask_iou=auto_iou,reg_iou=reg_iou,decision=decision,final_reason=final_reason,raw_regions=raw_regions,infra_candidate_regions=cand_regions,hybrid_regions=int(hybrid_raw_infra.max()),hybrid_source=hybrid_source,raw_score=raw_score,infra_score=cand_score,hybrid_score=hybrid_score,hybrid_q4_score=hybrid_q4_score,hybrid_candidate_score=hybrid_candidate_score,infra_bgrad=cand_bgrad)
         pair_row.update(raw_canny_pair_fields)
         pair_rows.append(pair_row)
         if args.eval and gt_gra_blocks and gt_sub_masks:
@@ -1329,8 +975,8 @@ def main():
                 gt_lab[(sm>0)&inside_eval]=cur; cur+=1
             if gt_lab[inside_eval].max()>0:
                 gt_lab=relabel(fill_zero_inside(gt_lab,inside_eval))
-                # evaluate raw, infra, final for same pair.
-                eval_items=[('raw_v3_warp',raw_warp_label,'raw'),('merge_to_one',one_label,'one'),('infra_candidate',infra_candidate,'infra'),('infra_candidate_coarse',infra_candidate_coarse,'infra_coarse'),('infra_coarse_t2',infra_coarse_t2,'infra_t2'),('infra_coarse_t3',infra_coarse_t3,'infra_t3'),('infra_coarse_t4',infra_coarse_t4,'infra_t4'),('hybrid_raw_infra',hybrid_raw_infra,'hybrid'),('raw_led_refined',raw_led_refined,'raw_led'),('raw_led_weakmerge',raw_led_weakmerge,'raw_led_weakmerge'),('mean_shift_watershed',mean_shift_watershed,'watershed'),('watershed_raw_seed',watershed_raw,'watershed_raw'),('watershed_raw_led_seed',watershed_raw_led,'watershed_raw_led'),('raw_canny_vote3',raw_canny_vote3,'raw_canny_vote3'),('raw_canny_lcorr_closed',raw_canny_lcorr_closed,'raw_canny_lcorr_closed'),('raw_canny_union_closed',raw_canny_union_closed,'raw_canny_union_closed'),('raw_canny_recall_clean',raw_canny_recall_clean,'raw_canny_recall_clean'),('selective_hybrid_v4_smooth',final,decision)]
+                # evaluate only the compact candidate families that can become final.
+                eval_items=[('raw_v3_warp',raw_warp_label,'raw'),('merge_to_one',one_label,'one'),('hybrid_raw_infra',hybrid_raw_infra,'hybrid'),('raw_canny_vote3',raw_canny_vote3,'raw_canny_vote3'),('raw_canny_lcorr_closed',raw_canny_lcorr_closed,'raw_canny_lcorr_closed'),('raw_canny_recall_clean',raw_canny_recall_clean,'raw_canny_recall_clean'),('selective_hybrid_v4_smooth',final,decision)]
                 for method,label,dec in eval_items:
                     pred=relabel(fill_zero_inside(label,inside_eval)) if label.max()>0 else label
                     metric_rows.append(asdict(eval_metrics(method,raw_fn,infra_fn,int(raw_im['id']),int(infra_im['id']),1,1,reg_iou,dec,gt_lab,pred,inside_eval,raw_regions,cand_regions,raw_score,cand_score,auto_iou)))
@@ -1344,7 +990,7 @@ def main():
                 panels.append(panel)
                 Image.fromarray(panel).save(per_dir/f"raw{raw_im['id']}_infra{infra_im['id']}.jpg",quality=95)
         # save masks
-        np.savez_compressed(per_dir/f"raw{raw_im['id']}_infra{infra_im['id']}_masks.npz",raw_label=raw_label_full,raw_gra=raw_gra_union,auto_infra_gra=auto_infra_gra,inferred_gra=inferred_gra,raw_warp_label=raw_warp_label,infra_q4_evidence=infra_q4_evidence,infra_candidate=infra_candidate,infra_candidate_coarse=infra_candidate_coarse,infra_highsens_candidate=infra_highsens_candidate,infra_coarse_t2=infra_coarse_t2,infra_coarse_t3=infra_coarse_t3,infra_coarse_t4=infra_coarse_t4,hybrid_q4=hybrid_q4,hybrid_from_candidate=hybrid_from_candidate,hybrid_raw_infra=hybrid_raw_infra,raw_led_q4=raw_led_q4,raw_led_candidate=raw_led_candidate,raw_led_refined=raw_led_refined,raw_led_weakmerge=raw_led_weakmerge,watershed_raw=watershed_raw,watershed_raw_led=watershed_raw_led,mean_shift_watershed=mean_shift_watershed,raw_canny_vote3=raw_canny_vote3,raw_canny_lcorr_closed=raw_canny_lcorr_closed,raw_canny_union_closed=raw_canny_union_closed,raw_canny_recall_clean=raw_canny_recall_clean,one_label=one_label,final_label=final,M=M)
+        np.savez_compressed(per_dir/f"raw{raw_im['id']}_infra{infra_im['id']}_masks.npz",raw_label=raw_label_full,raw_gra=raw_gra_union,auto_infra_gra=auto_infra_gra,inferred_gra=inferred_gra,raw_warp_label=raw_warp_label,infra_q4_evidence=infra_q4_evidence,infra_candidate=infra_candidate,hybrid_q4=hybrid_q4,hybrid_from_candidate=hybrid_from_candidate,hybrid_raw_infra=hybrid_raw_infra,raw_canny_vote3=raw_canny_vote3,raw_canny_lcorr_closed=raw_canny_lcorr_closed,raw_canny_recall_clean=raw_canny_recall_clean,one_label=one_label,final_label=final,M=M)
     pd.DataFrame(pair_rows).to_csv(args.out_dir/'pair_registration_decisions.csv',index=False)
     if metric_rows:
         df=pd.DataFrame(metric_rows)
