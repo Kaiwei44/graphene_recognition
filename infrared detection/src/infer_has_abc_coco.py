@@ -60,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--big-category", default="gra")
     ap.add_argument("--has-abc-category", default="has_ABC")
     ap.add_argument("--save-segmentation-overview", action="store_true")
+    ap.add_argument(
+        "--no-kmeans-visualizations",
+        action="store_true",
+        help="Do not save full-pair KMeans visualization images.",
+    )
 
     # ABC detector defaults mirror experiment_subpart_binary_kmeans.py.
     ap.add_argument("--erode-px", type=int, default=2)
@@ -159,6 +164,47 @@ def run_abc_for_subpart(
         args.min_minority_frac,
     )
     return accepted, reason, result
+
+
+def safe_name(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
+
+
+def pair_kmeans_visualization(
+    gray: np.ndarray,
+    final_label: np.ndarray,
+    ann_masks: Dict[int, np.ndarray],
+    higher_gray_map: np.ndarray,
+) -> np.ndarray:
+    """Draw full-frame registered segmentation, final subparts, and accepted high-gray KMeans pixels."""
+    out = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    higher_gray_map = higher_gray_map.astype(bool)
+    if np.any(higher_gray_map):
+        out[higher_gray_map] = (
+            0.10 * out[higher_gray_map] + 0.90 * np.array([0, 255, 0], dtype=np.uint8)
+        ).astype(np.uint8)
+
+    # Yellow: original RAW graphene segmentation after registration to the INFRA frame.
+    for ann_mask in ann_masks.values():
+        abc.draw_contours(out, ann_mask, (0, 255, 255), 2)
+
+    # Cyan: final subpart boundaries on the INFRA frame.
+    for label_id in [int(x) for x in np.unique(final_label) if int(x) > 0]:
+        subpart_mask = final_label == label_id
+        abc.draw_contours(out, subpart_mask, (255, 255, 0), 1)
+        ys, xs = np.where(subpart_mask)
+        if xs.size:
+            cv2.putText(
+                out,
+                f"L{label_id}",
+                (int(np.median(xs)), int(np.median(ys))),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+    return out
 
 
 def source_gra_annotations(raw_im: dict, anns_by: Dict[int, List[dict]], big_id: int) -> List[dict]:
@@ -287,6 +333,10 @@ def main() -> None:
     selected_by_ann: Dict[int, dict] = {}
     subpart_rows: List[dict] = []
     selected_rows: List[dict] = []
+    kmeans_vis_dir = args.output_dir / "kmeans_visualizations"
+    kmeans_visualization_paths: List[str] = []
+    if not args.no_kmeans_visualizations:
+        kmeans_vis_dir.mkdir(parents=True, exist_ok=True)
 
     for row in decisions:
         raw_file = row["raw_file"]
@@ -310,6 +360,8 @@ def main() -> None:
         gray_smooth = make_gray_smooth(gray, args.gaussian_sigma)
         ann_masks = warped_annotation_masks(raw_im, gra_anns, matrix, final_label.shape)
         anns_by_id = {int(a["id"]): a for a in gra_anns}
+        higher_gray_map = np.zeros(gray.shape, dtype=bool)
+        pair_subpart_rows: List[dict] = []
 
         for label_id in [int(x) for x in np.unique(final_label) if int(x) > 0]:
             accepted, reason, result = run_abc_for_subpart(
@@ -343,11 +395,22 @@ def main() -> None:
                 "smooth_gray_median_delta": np.nan if result is None else result["smooth_median_delta"],
                 "minority_class": "" if result is None else result["minority_class"],
                 "minority_frac": np.nan if result is None else result["minority_frac"],
+                "higher_gray_class": "",
                 "effective_px": 0 if result is None else result["effective_px"],
                 "decision": row.get("decision", ""),
                 "final_reason": row.get("final_reason", ""),
+                "kmeans_visualization": "",
             }
             subpart_rows.append(summary)
+            pair_subpart_rows.append(summary)
+
+            if not args.no_kmeans_visualizations and result is not None:
+                higher_gray_class = int(
+                    max(result["class_rows"], key=lambda class_row: class_row["raw_median"])["class_id"]
+                )
+                if accepted:
+                    higher_gray_map |= result["class_map"] == higher_gray_class
+                summary["higher_gray_class"] = higher_gray_class
 
             if not accepted or assigned_ann_id is None:
                 continue
@@ -358,6 +421,17 @@ def main() -> None:
                     "infra_file": infra_file,
                 }
             selected_by_ann[assigned_ann_id]["details"].append(summary)
+
+        if not args.no_kmeans_visualizations:
+            pair = abc.infer_pair_name(raw_file)
+            vis_name = safe_name(f"{pair}_raw{raw_id}_infra{infra_id}_registered_subparts_kmeans.jpg")
+            vis_rel = str(Path("kmeans_visualizations") / vis_name)
+            vis = pair_kmeans_visualization(gray, final_label, ann_masks, higher_gray_map)
+            if not cv2.imwrite(str(kmeans_vis_dir / vis_name), vis):
+                raise RuntimeError(f"failed to write KMeans visualization: {kmeans_vis_dir / vis_name}")
+            kmeans_visualization_paths.append(vis_rel)
+            for summary in pair_subpart_rows:
+                summary["kmeans_visualization"] = vis_rel
 
     output_data = build_output_coco(input_data, images_by_id, selected_by_ann, args.has_abc_category)
     output_coco.write_text(json.dumps(output_data, indent=2), encoding="utf-8")
@@ -374,6 +448,9 @@ def main() -> None:
                 "max_gray_delta": max(float(d["raw_gray_median_delta"]) for d in item["details"]),
                 "max_minority_frac": max(float(d["minority_frac"]) for d in item["details"]),
                 "infra_file": item["infra_file"],
+                "kmeans_visualizations": ";".join(
+                    dict.fromkeys(d["kmeans_visualization"] for d in item["details"] if d.get("kmeans_visualization"))
+                ),
             }
         )
 
@@ -409,6 +486,7 @@ def main() -> None:
                     "subparts_checked": len(subpart_rows),
                     "selected_annotations": len(selected_rows),
                     "output_images": len(output_data["images"]),
+                    "kmeans_visualizations": len(kmeans_visualization_paths),
                 },
             },
             indent=2,
