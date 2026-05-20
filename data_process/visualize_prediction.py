@@ -11,6 +11,7 @@ import numpy as np
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
 from detectron2.engine import DefaultPredictor
+from detectron2.utils.visualizer import ColorMode, Visualizer
 import torch
 
 try:
@@ -23,10 +24,9 @@ try:
 except Exception:  # pragma: no cover
     mask_utils = None
 
-from maskterial.measurements import attach_measurements_to_flake
+from maskterial.maskterial import MaskTerial
 from maskterial.modeling.segmentation_models import M2F_model
 from maskterial.modeling.segmentation_models.M2F import maskformer_model  # noqa: F401
-from maskterial.structures.FlakeClass import Flake
 from maskterial.utils.dataset_functions import setup_config
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -85,78 +85,6 @@ def flake_shape_complexity(flake) -> float:
     return float((perimeter_px * perimeter_px) / (4.0 * np.pi * area_px))
 
 
-def extract_mask_properties(mask: np.ndarray):
-    mask = mask.astype(np.uint8)
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
-    if not contours:
-        return None, None
-
-    contour = max(contours, key=cv2.contourArea)
-    clean_mask = np.zeros_like(mask, dtype=np.uint8)
-    cv2.drawContours(clean_mask, [contour], -1, 1, -1)
-
-    size = int(np.count_nonzero(clean_mask))
-    moments = cv2.moments(contour)
-    if moments["m00"] > 0:
-        center_x = int(moments["m10"] / moments["m00"])
-        center_y = int(moments["m01"] / moments["m00"])
-    else:
-        ys, xs = np.nonzero(clean_mask)
-        center_x = int(np.mean(xs)) if len(xs) else 0
-        center_y = int(np.mean(ys)) if len(ys) else 0
-
-    rect = cv2.minAreaRect(contour)
-    max_sidelength = float(max(rect[1]))
-    min_sidelength = float(min(rect[1]))
-    return {
-        "size": size,
-        "center": (center_x, center_y),
-        "max_sidelength": max_sidelength,
-        "min_sidelength": min_sidelength,
-    }, clean_mask
-
-
-def segmentation_instances_to_flakes(instances, score_threshold: float, size_threshold_px: int):
-    instances = instances[instances.scores > score_threshold]
-    if len(instances) == 0:
-        return []
-    instances = instances[
-        torch.count_nonzero(instances.pred_masks, dim=(1, 2)) > size_threshold_px
-    ]
-
-    flakes = []
-    for instance_index in range(len(instances)):
-        mask = instances[instance_index].pred_masks.squeeze()
-        score = float(instances[instance_index].scores.squeeze().item())
-        class_id = int(instances[instance_index].pred_classes.squeeze().item()) + 1
-        if isinstance(mask, torch.Tensor):
-            mask = mask.cpu().numpy().astype(np.uint8)
-
-        properties, clean_mask = extract_mask_properties(mask)
-        if properties is None:
-            continue
-
-        flake = Flake(
-            mask=clean_mask,
-            false_positive_probability=1.0 - score,
-            thickness=str(class_id),
-            mean_contrast=np.array([0, 0, 0]),
-            **properties,
-        )
-        flakes.append(attach_measurements_to_flake(flake))
-    return flakes
-
-
-@torch.inference_mode()
-def predict_segmentation_flakes(seg_model, image_bgr: np.ndarray, score_threshold: float, size_threshold_px: int):
-    instances = seg_model(image_bgr)
-    return segmentation_instances_to_flakes(instances, score_threshold, size_threshold_px)
-
-
 def color_for_index(index: int) -> tuple[int, int, int]:
     palette = [
         (0, 255, 255),
@@ -189,31 +117,10 @@ def format_flake_label(index: int, flake, label_mode: str) -> str:
 
 
 def draw_text_box(image, text: str, origin: tuple[int, int], color: tuple[int, int, int]):
-    if not text:
-        return
-
-    image_h, image_w = image.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    thickness = 1
-    text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    text_w, text_h = text_size
-
-    x = min(max(origin[0], 0), max(0, image_w - text_w - 8))
-    y = min(max(origin[1], text_h + 8), max(text_h + 8, image_h - baseline - 4))
-    cv2.rectangle(
-        image,
-        (x - 3, y - text_h - 6),
-        (x + text_w + 6, y + baseline + 3),
-        (0, 0, 0),
-        -1,
-    )
-    cv2.putText(image, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+    return
 
 
 def draw_flake_labels(image, flakes, scale: float, label_mode: str):
-    if label_mode == "none":
-        return image
     image = np.ascontiguousarray(image)
     for index, flake in enumerate(flakes, start=1):
         text = format_flake_label(index, flake, label_mode)
@@ -242,6 +149,7 @@ def sort_flakes(flakes, sort_by: str):
 
 def draw_flake_masks(image, flakes, scale: float):
     output = image.copy()
+    overlay = image.copy()
     for index, flake in enumerate(flakes, start=1):
         mask = flake.mask.astype(np.uint8)
         if scale != 1.0:
@@ -260,31 +168,7 @@ def draw_flake_masks(image, flakes, scale: float):
             cv2.CHAIN_APPROX_SIMPLE,
         )
         cv2.drawContours(output, contours, -1, color, 2, cv2.LINE_AA)
-    return output
-
-def draw_gt_masks(image, dataset_dict: dict, scale: float, min_area_px: int = 0):
-    output = image.copy()
-    height, width = dataset_dict["height"], dataset_dict["width"]
-    for index, annotation in enumerate(dataset_dict.get("annotations", []), start=1):
-        if int(annotation.get("iscrowd", 0)):
-            continue
-        mask = annotation_to_mask(annotation, height, width).astype(np.uint8)
-        if int(np.count_nonzero(mask)) < min_area_px:
-            continue
-        if scale != 1.0:
-            mask = cv2.resize(
-                mask,
-                dsize=None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_NEAREST,
-            )
-        contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-        cv2.drawContours(output, contours, -1, color_for_index(index), 2, cv2.LINE_AA)
+    output = cv2.addWeighted(overlay, 0.25, output, 0.75, 0.0)
     return output
 
 
@@ -589,7 +473,7 @@ def main():
     parser.add_argument(
         "--label-mode",
         choices=["full", "area", "score", "index", "none"],
-        default="none",
+        default="full",
     )
     parser.add_argument("--sort-by", choices=["score", "area", "none"], default="score")
     parser.add_argument("--summary-csv", default=None)
@@ -662,10 +546,18 @@ def main():
 
     register_coco_instances(args.dataset_name, {}, args.ann, args.image_root)
     MetadataCatalog.get(args.dataset_name).set(thing_classes=[args.class_name])
+    meta = MetadataCatalog.get(args.dataset_name)
     predictor = DefaultPredictor(cfg)
     seg_model = M2F_model(
         model=predictor.model,
         config=cfg,
+        device=torch.device(cfg.MODEL.DEVICE),
+    )
+    maskterial = MaskTerial(
+        segmentation_model=seg_model,
+        score_threshold=args.score_threshold,
+        min_class_occupancy=0.0,
+        size_threshold=args.size_threshold_px,
         device=torch.device(cfg.MODEL.DEVICE),
     )
     dataset_dicts = DatasetCatalog.get(args.dataset_name)
@@ -707,12 +599,7 @@ def main():
             print(f"Skipping unreadable image: {dataset_dict['file_name']}")
             continue
 
-        raw_flakes = predict_segmentation_flakes(
-            seg_model,
-            img,
-            score_threshold=args.score_threshold,
-            size_threshold_px=args.size_threshold_px,
-        )
+        raw_flakes = maskterial.predict(img)
         base = os.path.splitext(os.path.basename(dataset_dict["file_name"]))[0]
         if use_postprocess:
             postprocess_result = postprocessor.run(
@@ -766,21 +653,13 @@ def main():
         cv2.imwrite(pred_path, pred_img)
 
         if args.draw_gt:
-            gt_img = img
-            if args.scale != 1.0:
-                gt_img = cv2.resize(
-                    gt_img,
-                    dsize=None,
-                    fx=args.scale,
-                    fy=args.scale,
-                    interpolation=cv2.INTER_LINEAR,
-                )
-            gt_img = draw_gt_masks(
-                gt_img,
-                dataset_dict,
-                args.scale,
-                min_area_px=args.eval_min_gt_area_px,
+            gt_visualizer = Visualizer(
+                img[:, :, ::-1],
+                metadata=meta,
+                scale=args.scale,
+                instance_mode=ColorMode.IMAGE,
             )
+            gt_img = gt_visualizer.draw_dataset_dict(dataset_dict).get_image()[:, :, ::-1]
             cv2.imwrite(os.path.join(args.outdir, f"{base}_gt.jpg"), gt_img)
 
         print(f"saved: {pred_path}")
