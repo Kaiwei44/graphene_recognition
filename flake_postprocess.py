@@ -155,19 +155,16 @@ class GrapheneFlakePostprocessor:
 
     def draw_flakes(self, image_bgr: np.ndarray, flakes: list[Flake]) -> np.ndarray:
         output = image_bgr.copy()
-        overlay = image_bgr.copy()
         for index, flake in enumerate(flakes, start=1):
             mask = self._as_mask(flake.mask)
             color = self._color_for_index(index)
-            overlay[mask.astype(bool)] = color
             contours, _ = cv2.findContours(
                 mask,
                 cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
             cv2.drawContours(output, contours, -1, color, 2, cv2.LINE_AA)
-            self._draw_label(output, flake, index, color)
-        return cv2.addWeighted(overlay, 0.25, output, 0.75, 0.0)
+        return output
 
     def _to_lab(self, image_bgr: np.ndarray) -> np.ndarray:
         image_float = image_bgr.astype(np.float32) / 255.0

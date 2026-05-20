@@ -11,7 +11,6 @@ import numpy as np
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
 from detectron2.engine import DefaultPredictor
-from detectron2.utils.visualizer import ColorMode, Visualizer
 import torch
 
 try:
@@ -140,6 +139,8 @@ def draw_text_box(image, text: str, origin: tuple[int, int], color: tuple[int, i
 
 
 def draw_flake_labels(image, flakes, scale: float, label_mode: str):
+    if label_mode == "none":
+        return image
     image = np.ascontiguousarray(image)
     for index, flake in enumerate(flakes, start=1):
         text = format_flake_label(index, flake, label_mode)
@@ -168,7 +169,6 @@ def sort_flakes(flakes, sort_by: str):
 
 def draw_flake_masks(image, flakes, scale: float):
     output = image.copy()
-    overlay = image.copy()
     for index, flake in enumerate(flakes, start=1):
         mask = flake.mask.astype(np.uint8)
         if scale != 1.0:
@@ -187,8 +187,31 @@ def draw_flake_masks(image, flakes, scale: float):
             cv2.CHAIN_APPROX_SIMPLE,
         )
         cv2.drawContours(output, contours, -1, color, 2, cv2.LINE_AA)
+    return output
 
-    output = cv2.addWeighted(overlay, 0.25, output, 0.75, 0.0)
+def draw_gt_masks(image, dataset_dict: dict, scale: float, min_area_px: int = 0):
+    output = image.copy()
+    height, width = dataset_dict["height"], dataset_dict["width"]
+    for index, annotation in enumerate(dataset_dict.get("annotations", []), start=1):
+        if int(annotation.get("iscrowd", 0)):
+            continue
+        mask = annotation_to_mask(annotation, height, width).astype(np.uint8)
+        if int(np.count_nonzero(mask)) < min_area_px:
+            continue
+        if scale != 1.0:
+            mask = cv2.resize(
+                mask,
+                dsize=None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_NEAREST,
+            )
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(output, contours, -1, color_for_index(index), 2, cv2.LINE_AA)
     return output
 
 
@@ -493,7 +516,7 @@ def main():
     parser.add_argument(
         "--label-mode",
         choices=["full", "area", "score", "index", "none"],
-        default="full",
+        default="none",
     )
     parser.add_argument("--sort-by", choices=["score", "area", "none"], default="score")
     parser.add_argument("--summary-csv", default=None)
@@ -566,8 +589,6 @@ def main():
 
     register_coco_instances(args.dataset_name, {}, args.ann, args.image_root)
     MetadataCatalog.get(args.dataset_name).set(thing_classes=[args.class_name])
-    meta = MetadataCatalog.get(args.dataset_name)
-
     predictor = DefaultPredictor(cfg)
     seg_model = M2F_model(
         model=predictor.model,
@@ -674,15 +695,21 @@ def main():
         cv2.imwrite(pred_path, pred_img)
 
         if args.draw_gt:
-            gt_visualizer = Visualizer(
-                img[:, :, ::-1],
-                metadata=meta,
-                scale=args.scale,
-                instance_mode=ColorMode.IMAGE,
+            gt_img = img
+            if args.scale != 1.0:
+                gt_img = cv2.resize(
+                    gt_img,
+                    dsize=None,
+                    fx=args.scale,
+                    fy=args.scale,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            gt_img = draw_gt_masks(
+                gt_img,
+                dataset_dict,
+                args.scale,
+                min_area_px=args.eval_min_gt_area_px,
             )
-            gt_img = gt_visualizer.draw_dataset_dict(dataset_dict).get_image()[
-                :, :, ::-1
-            ]
             cv2.imwrite(os.path.join(args.outdir, f"{base}_gt.jpg"), gt_img)
 
         print(f"saved: {pred_path}")
