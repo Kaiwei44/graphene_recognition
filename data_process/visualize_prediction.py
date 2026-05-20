@@ -14,6 +14,10 @@ from detectron2.engine import DefaultPredictor
 from detectron2.utils.visualizer import ColorMode, Visualizer
 import torch
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 try:
     from scipy.optimize import linear_sum_assignment
 except Exception:  # pragma: no cover
@@ -28,10 +32,6 @@ from maskterial.maskterial import MaskTerial
 from maskterial.modeling.segmentation_models import M2F_model
 from maskterial.modeling.segmentation_models.M2F import maskformer_model  # noqa: F401
 from maskterial.utils.dataset_functions import setup_config
-
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
 
 from flake_postprocess import GrapheneFlakePostprocessor, PostprocessParams
 
@@ -117,7 +117,19 @@ def format_flake_label(index: int, flake, label_mode: str) -> str:
 
 
 def draw_text_box(image, text: str, origin: tuple[int, int], color: tuple[int, int, int]):
-    return
+    if not text:
+        return
+
+    image_h, image_w = image.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    text_w, text_h = text_size
+
+    x = min(max(origin[0], 0), max(0, image_w - text_w - 8))
+    y = min(max(origin[1], text_h + 8), max(text_h + 8, image_h - baseline - 4))
+    cv2.putText(image, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
 
 
 def draw_flake_labels(image, flakes, scale: float, label_mode: str):
