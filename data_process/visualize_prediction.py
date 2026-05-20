@@ -23,9 +23,10 @@ try:
 except Exception:  # pragma: no cover
     mask_utils = None
 
-from maskterial.maskterial import MaskTerial
+from maskterial.measurements import attach_measurements_to_flake
 from maskterial.modeling.segmentation_models import M2F_model
 from maskterial.modeling.segmentation_models.M2F import maskformer_model  # noqa: F401
+from maskterial.structures.FlakeClass import Flake
 from maskterial.utils.dataset_functions import setup_config
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -82,6 +83,78 @@ def flake_shape_complexity(flake) -> float:
     perimeter_px = sum(cv2.arcLength(contour, True) for contour in contours)
     area_px = max(int(np.count_nonzero(mask)), 1)
     return float((perimeter_px * perimeter_px) / (4.0 * np.pi * area_px))
+
+
+def extract_mask_properties(mask: np.ndarray):
+    mask = mask.astype(np.uint8)
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None, None
+
+    contour = max(contours, key=cv2.contourArea)
+    clean_mask = np.zeros_like(mask, dtype=np.uint8)
+    cv2.drawContours(clean_mask, [contour], -1, 1, -1)
+
+    size = int(np.count_nonzero(clean_mask))
+    moments = cv2.moments(contour)
+    if moments["m00"] > 0:
+        center_x = int(moments["m10"] / moments["m00"])
+        center_y = int(moments["m01"] / moments["m00"])
+    else:
+        ys, xs = np.nonzero(clean_mask)
+        center_x = int(np.mean(xs)) if len(xs) else 0
+        center_y = int(np.mean(ys)) if len(ys) else 0
+
+    rect = cv2.minAreaRect(contour)
+    max_sidelength = float(max(rect[1]))
+    min_sidelength = float(min(rect[1]))
+    return {
+        "size": size,
+        "center": (center_x, center_y),
+        "max_sidelength": max_sidelength,
+        "min_sidelength": min_sidelength,
+    }, clean_mask
+
+
+def segmentation_instances_to_flakes(instances, score_threshold: float, size_threshold_px: int):
+    instances = instances[instances.scores > score_threshold]
+    if len(instances) == 0:
+        return []
+    instances = instances[
+        torch.count_nonzero(instances.pred_masks, dim=(1, 2)) > size_threshold_px
+    ]
+
+    flakes = []
+    for instance_index in range(len(instances)):
+        mask = instances[instance_index].pred_masks.squeeze()
+        score = float(instances[instance_index].scores.squeeze().item())
+        class_id = int(instances[instance_index].pred_classes.squeeze().item()) + 1
+        if isinstance(mask, torch.Tensor):
+            mask = mask.cpu().numpy().astype(np.uint8)
+
+        properties, clean_mask = extract_mask_properties(mask)
+        if properties is None:
+            continue
+
+        flake = Flake(
+            mask=clean_mask,
+            false_positive_probability=1.0 - score,
+            thickness=str(class_id),
+            mean_contrast=np.array([0, 0, 0]),
+            **properties,
+        )
+        flakes.append(attach_measurements_to_flake(flake))
+    return flakes
+
+
+@torch.inference_mode()
+def predict_segmentation_flakes(seg_model, image_bgr: np.ndarray, score_threshold: float, size_threshold_px: int):
+    instances = seg_model(image_bgr)
+    return segmentation_instances_to_flakes(instances, score_threshold, size_threshold_px)
 
 
 def color_for_index(index: int) -> tuple[int, int, int]:
@@ -595,13 +668,6 @@ def main():
         config=cfg,
         device=torch.device(cfg.MODEL.DEVICE),
     )
-    maskterial = MaskTerial(
-        segmentation_model=seg_model,
-        score_threshold=args.score_threshold,
-        min_class_occupancy=0.0,
-        size_threshold=args.size_threshold_px,
-        device=torch.device(cfg.MODEL.DEVICE),
-    )
     dataset_dicts = DatasetCatalog.get(args.dataset_name)
     if args.all_images or args.num_samples == -1:
         samples = dataset_dicts
@@ -641,7 +707,12 @@ def main():
             print(f"Skipping unreadable image: {dataset_dict['file_name']}")
             continue
 
-        raw_flakes = maskterial.predict(img)
+        raw_flakes = predict_segmentation_flakes(
+            seg_model,
+            img,
+            score_threshold=args.score_threshold,
+            size_threshold_px=args.size_threshold_px,
+        )
         base = os.path.splitext(os.path.basename(dataset_dict["file_name"]))[0]
         if use_postprocess:
             postprocess_result = postprocessor.run(
