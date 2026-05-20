@@ -1,2 +1,0 @@
-exported_image,source_image,filename,image_id,ann_id,layer,pred_layer,score,abs_error,review
-/mnt/tf_data/TechFin/home/group_6/MaskTerial-main/training_log/green_ordinal_largest_inner_median_v10/test_large_error_images/001_gt4_pred6_err2_score9.051_ann75_1-7-4-8_png.rf.7c262213d2b3d9b0de2f050c0e0c742c.jpg,/mnt/tf_data/TechFin/home/group_6/Data/white_balance_copy_layers.v10-argmented-10x.coco-segmentation/test/1-7-4-8_png.rf.7c262213d2b3d9b0de2f050c0e0c742c.jpg,1-7-4-8_png.rf.7c262213d2b3d9b0de2f050c0e0c742c.jpg,65,75,4,6,9.051238020855106,2.0,False
