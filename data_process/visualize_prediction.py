@@ -646,7 +646,8 @@ def main():
                 interpolation=cv2.INTER_LINEAR,
             )
         pred_img = draw_flake_masks(pred_img, flakes, args.scale)
-        pred_img = draw_flake_labels(pred_img, flakes, args.scale, args.label_mode)
+        if use_postprocess:
+            pred_img = draw_flake_labels(pred_img, flakes, args.scale, args.label_mode)
 
         if use_postprocess:
             print(
